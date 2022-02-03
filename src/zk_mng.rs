@@ -1,13 +1,16 @@
-use std::fmt::format;
-use std::{collections::HashMap, sync::Arc};
-
 use anyhow::anyhow;
 use const_str::concat;
-use lazy_static::lazy_static;
+use futures::future::try_join_all;
+use futures::stream::iter;
+use futures::{StreamExt, TryFutureExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
-use tokio::sync::Mutex;
-use zookeeper_async::recipes::cache::PathChildrenCache;
+use std::collections::hash_map::Entry;
+use std::collections::HashSet;
+use std::fmt::format;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{oneshot, Mutex};
+use zookeeper_async::recipes::cache::{PathChildrenCache, PathChildrenCacheEvent};
 use zookeeper_async::{Acl, CreateMode, ZooKeeper, ZooKeeperExt};
 
 const TASKS_ROOT: &str = "/tasks";
@@ -21,7 +24,7 @@ const SLICE_LEN: usize = const_str::len!("slice");
 const TASK_LEN: usize = const_str::len!("task");
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-struct TaskId(usize);
+pub struct TaskId(usize);
 impl TaskId {
     fn from_path(p: &str) -> anyhow::Result<Self> {
         let id: usize = p
@@ -31,13 +34,23 @@ impl TaskId {
             .ok_or(anyhow!("task from path error"))?;
         Ok(Self(id))
     }
+    #[inline(always)]
+    fn to_path(&self) -> String {
+        format!("{}{:0width$}", TASKS_PATH, self.id(), width = 10)
+    }
+    #[inline(always)]
     pub fn id(&self) -> usize {
         self.0
     }
 }
+impl From<usize> for TaskId {
+    fn from(i: usize) -> Self {
+        Self(i)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-struct SliceId(usize);
+pub struct SliceId(usize);
 
 impl SliceId {
     fn from_path(p: &str) -> anyhow::Result<Self> {
@@ -48,23 +61,40 @@ impl SliceId {
             .ok_or(anyhow!("slice from path error"))?;
         Ok(Self(id))
     }
+
+    fn to_path(&self) -> String {
+        format!("slice{:0width$}", self.id(), width = 10)
+    }
+
     pub fn id(&self) -> usize {
         self.0
     }
 }
 
+impl From<usize> for SliceId {
+    fn from(i: usize) -> Self {
+        Self(i)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-struct TaskSliceId(TaskId, SliceId);
+pub struct TaskSliceId(TaskId, SliceId);
 
 impl TaskSliceId {
-    fn from_task_slice(task_id: TaskId, slice_id: SliceId) -> Self {
+    pub fn from_task_slice(task_id: TaskId, slice_id: SliceId) -> Self {
         Self(task_id, slice_id)
     }
+    #[inline(always)]
     pub fn task_id(&self) -> TaskId {
         self.0
     }
+    #[inline(always)]
     pub fn slice_id(&self) -> SliceId {
         self.1
+    }
+    #[inline(always)]
+    pub fn to_path(&self) -> String {
+        format!("{}/{}", self.task_id().to_path(), self.slice_id().to_path())
     }
 }
 
@@ -86,8 +116,28 @@ impl WorkerId {
 }
 
 struct TaskData {
-    worker_completed: (PathChildrenCache, Vec<WorkerId>), // 完成了所有切片的worker
-    slice_completed: HashMap<SliceId, (PathChildrenCache, Vec<WorkerId>)>, // 完成了部分切片的worker
+    slice_completed: HashMap<SliceId, (PathChildrenCache, HashSet<WorkerId>)>, // 完成了部分切片的worker
+}
+
+impl TaskData {
+    fn new() -> Self {
+        Self {
+            slice_completed: HashMap::new(),
+        }
+    }
+}
+
+fn get_task_slice_completed_list(
+    data: &mut HashMap<TaskId, TaskData>,
+    task_slice_id: TaskSliceId,
+) -> Option<&mut HashSet<WorkerId>> {
+    if let Some(task_data) = data.get_mut(&task_slice_id.task_id()) {
+        return task_data
+            .slice_completed
+            .get_mut(&task_slice_id.slice_id())
+            .map(|x| &mut x.1);
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -98,16 +148,35 @@ enum WorkerStatus {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-enum TaskStatus {
+pub enum TaskStatus {
     Initing,
     Working,
     Done,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub enum TaskType {
+    Spread, // 传播型，可以从其他worker获取任务
+    Hosted, // 只能从Host获取任务
+}
+#[derive(Serialize, Deserialize, Debug)]
 struct TaskControlInfo {
+    publisher: WorkerId,
     slice_num: usize,
+    task_type: TaskType,
     status: TaskStatus,
 }
 
+impl TaskControlInfo {
+    fn new(publisher: WorkerId, slice_num: usize, task_type: TaskType) -> Self {
+        Self {
+            publisher,
+            slice_num,
+            task_type,
+            status: TaskStatus::Initing,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct WorkerData {
     status: WorkerStatus,
@@ -124,16 +193,23 @@ impl WorkerData {
 pub struct ZkMng {
     zk: Arc<ZooKeeper>,
     self_id: WorkerId,
-    task_queue_cache: PathChildrenCache,
+    task_queue_cache: Arc<Mutex<(PathChildrenCache, HashMap<TaskId, String>)>>,
     tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
     worker_data_cache: Arc<Mutex<HashMap<WorkerId, WorkerData>>>,
     opr_tx: UnboundedSender<OperationEvent>,
 }
 enum OperationEvent {
     AddTaskDataWatcher(TaskId),
+    TaskPublished(TaskId),
+    TaskCompleted(TaskId),
+    TaskPublish(TaskId, oneshot::Sender<anyhow::Result<()>>),
+    SliceCompleted(TaskSliceId, WorkerId),
+    SliceCompletedDeleted(TaskSliceId, WorkerId),
 }
+
 enum ZkEvent {
-    TaskAdded(TaskId),
+    TaskPublished(TaskId, WorkerId),
+    TaskCompleted(TaskId),
 }
 
 impl ZkMng {
@@ -142,6 +218,7 @@ impl ZkMng {
             ZooKeeper::connect(zk_addr, std::time::Duration::from_secs(10), |_| {}).await?,
         );
         zk.ensure_path(WORKER_ROOT).await?;
+        zk.ensure_path(TASKS_ROOT).await?;
         let self_id = {
             let p = zk
                 .create(
@@ -156,12 +233,20 @@ impl ZkMng {
 
         let (opr_tx, opr_rx) = unbounded_channel();
 
-        let task_queue_cache = Self::create_queue_cache_watch(zk.clone(), opr_tx.clone()).await?;
+        let task_queue_cache = Arc::new(Mutex::new((
+            Self::create_queue_cache_watch(zk.clone(), opr_tx.clone()).await?,
+            HashMap::new(),
+        )));
         let tasks_data_cache = Arc::new(Mutex::new(HashMap::new()));
         let worker_data_cache = Arc::new(Mutex::new(HashMap::new()));
 
-
-        tokio::spawn(Self::opr_event_proc(opr_rx));
+        tokio::spawn(Self::opr_event_proc(
+            zk.clone(),
+            opr_tx.clone(),
+            opr_rx,
+            tasks_data_cache.clone(),
+            task_queue_cache.clone(),
+        ));
 
         Ok(Self {
             zk,
@@ -172,39 +257,263 @@ impl ZkMng {
             opr_tx,
         })
     }
-    async fn opr_event_proc(mut opr_rx: UnboundedReceiver<OperationEvent>) {
+    async fn task_in_queue(zk: Arc<ZooKeeper>, task_id: TaskId) -> anyhow::Result<String> {
+        zk.create(
+            TASKS_QUEUE_PATH,
+            serde_json::to_vec(&task_id)?,
+            Acl::open_unsafe().clone(),
+            CreateMode::EphemeralSequential,
+        )
+        .await
+        .map_err(|e| anyhow!("in queue error: {}", e))
+    }
+    async fn task_out_queue(zk: Arc<ZooKeeper>, task_queue_path: &str) -> anyhow::Result<()> {
+        zk.delete(task_queue_path, None)
+            .await
+            .map_err(|e| anyhow!("out queue error: {}", e))
+    }
+    async fn opr_event_proc(
+        zk: Arc<ZooKeeper>,
+        opr_tx: UnboundedSender<OperationEvent>,
+        mut opr_rx: UnboundedReceiver<OperationEvent>,
+        tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+        task_queue_cache: Arc<Mutex<(PathChildrenCache, HashMap<TaskId, String>)>>,
+    ) {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
-                _ => {
-
+                OperationEvent::AddTaskDataWatcher(task_id) => {
+                    Self::create_task_slice_watch(
+                        zk.clone(),
+                        opr_tx.clone(),
+                        task_id,
+                        tasks_data_cache.clone(),
+                    )
+                    .await
+                    .expect("AddTaskDataWatcher failed");
+                }
+                OperationEvent::SliceCompleted(task_slice_id, worker_id) => {
+                    let mut lock = tasks_data_cache.lock().await;
+                    if let Some(completed_lst) =
+                        get_task_slice_completed_list(&mut lock, task_slice_id)
+                    {
+                        completed_lst.insert(worker_id);
+                    }
+                }
+                OperationEvent::SliceCompletedDeleted(task_slice_id, worker_id) => {
+                    let mut lock = tasks_data_cache.lock().await;
+                    if let Some(completed_lst) =
+                        get_task_slice_completed_list(&mut lock, task_slice_id)
+                    {
+                        completed_lst.remove(&worker_id);
+                    }
+                }
+                OperationEvent::TaskPublished(task_id) => {
+                    {
+                        let mut lock = tasks_data_cache.lock().await;
+                        lock.entry(task_id).or_insert(TaskData::new());
+                    }
+                    if let Ok((d, _)) = zk.get_data(&task_id.to_path(), false).await {
+                        if let Ok(task_data) = serde_json::from_slice::<TaskControlInfo>(&d) {
+                            match task_data.task_type {
+                                TaskType::Spread => {
+                                    let _ =
+                                        opr_tx.send(OperationEvent::AddTaskDataWatcher(task_id));
+                                }
+                                TaskType::Hosted => {}
+                            }
+                        }
+                    }
+                }
+                OperationEvent::TaskCompleted(task_id) => {
+                    tasks_data_cache.lock().await.remove(&task_id);
+                    if let Some(p) = task_queue_cache.lock().await.1.remove(&task_id) {
+                        let _ = Self::task_out_queue(zk.clone(), &p).await;
+                    }
+                }
+                OperationEvent::TaskPublish(task_id, tx) => {
+                    let _ = opr_tx.send(OperationEvent::AddTaskDataWatcher(task_id));
+                    if let Ok(p) = Self::task_in_queue(zk.clone(), task_id).await {
+                        task_queue_cache.lock().await.1.insert(task_id, p);
+                    }
+                    tx.send(Ok(())).unwrap()
                 }
             }
         }
     }
-    async fn create_queue_cache_watch(zk: Arc<ZooKeeper>, opr_tx: UnboundedSender<OperationEvent> ) -> anyhow::Result<PathChildrenCache> {
-        let cache = PathChildrenCache::new(zk, &TASKS_QUEUE_ROOT).await?;
-        cache.add_listener(|event| {
-            match event {
-                _ => {
-                    
+    pub async fn new_task(&self, slice_num: usize, task_type: TaskType) -> anyhow::Result<TaskId> {
+        let task_ctrl_info = TaskControlInfo::new(self.self_id, slice_num, task_type);
+        let mode = match task_type {
+            TaskType::Hosted => CreateMode::EphemeralSequential,
+            TaskType::Spread => CreateMode::PersistentSequential,
+        };
+        let p = self
+            .zk
+            .create(
+                TASKS_PATH,
+                serde_json::to_vec(&task_ctrl_info)?,
+                Acl::open_unsafe().clone(),
+                mode,
+            )
+            .await?;
+        let task_id = TaskId::from_path(&p)?;
+        // create slices
+        iter(0..slice_num)
+            .for_each_concurrent(0, |i| {
+                let zk_clone = self.zk.clone();
+                async move {
+                    let task_slice_path = TaskSliceId::from_task_slice(task_id, i.into()).to_path();
+                    zk_clone
+                        .create(&task_slice_path, vec![], Acl::open_unsafe().clone(), mode)
+                        .await
+                        .unwrap();
                 }
+            })
+            .await;
+        Ok(task_id)
+    }
+    pub async fn publish_task(&self, task_id: TaskId) -> anyhow::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.opr_tx
+            .send(OperationEvent::TaskPublish(task_id, tx))
+            .map_err(|e| anyhow!("send error: {}", e))?;
+        rx.await?
+    }
+
+    pub async fn report_task_slice_completed(
+        &self,
+        task_slice_id: TaskSliceId,
+    ) -> anyhow::Result<()> {
+        let p = task_slice_id.to_path();
+        self.zk
+            .create(
+                &p,
+                serde_json::to_vec(&self.self_id)?,
+                Acl::open_unsafe().clone(),
+                CreateMode::EphemeralSequential,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn get_task_ctrl_info(&self, task_id: TaskId) -> anyhow::Result<TaskControlInfo> {
+        let d = self.zk.get_data(&task_id.to_path(), false).await?.0;
+        serde_json::from_slice(&d).map_err(|e| anyhow!("deserialize failed: {}", e))
+    }
+    async fn set_task_ctrl_info(&self, task_id: TaskId, task_ctrl_info: &TaskControlInfo)->anyhow::Result<()> {
+        let _ = self.zk.set_data(&task_id.to_path(), serde_json::to_vec(task_ctrl_info)?, None).await?;
+        Ok(())
+    }
+
+    pub async fn get_task_status(&self, task_id: TaskId) -> anyhow::Result<TaskStatus> {
+        let ctrl_info = self.get_task_ctrl_info(task_id).await?;
+        Ok(ctrl_info.status)
+    }
+    pub async fn set_task_status(&self, task_id: TaskId, status: TaskStatus) -> anyhow::Result<()> {
+        let mut ctrl_info = self.get_task_ctrl_info(task_id).await?;
+        ctrl_info.status = status;
+        self.set_task_ctrl_info(task_id, &ctrl_info).await
+    }
+
+    async fn create_one_slice_watch(
+        zk: Arc<ZooKeeper>,
+        opr_tx: UnboundedSender<OperationEvent>,
+        task_slice_id: TaskSliceId,
+        tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+    ) -> anyhow::Result<()> {
+        let slice_completed_cache = PathChildrenCache::new(zk, &task_slice_id.to_path()).await?;
+        slice_completed_cache.add_listener(move |event| {
+            let mut id_map = HashMap::new();
+            match event {
+                PathChildrenCacheEvent::ChildAdded(p, data) => {
+                    let worker_id = serde_json::from_slice(&data.0).expect("invalid data");
+                    id_map.insert(p, worker_id);
+                    let _ = opr_tx.send(OperationEvent::SliceCompleted(task_slice_id, worker_id));
+                }
+                PathChildrenCacheEvent::ChildRemoved(p) => {
+                    if let Some(worker_id) = id_map.remove(&p) {
+                        let _ = opr_tx.send(OperationEvent::SliceCompletedDeleted(
+                            task_slice_id,
+                            worker_id,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        });
+        tasks_data_cache
+            .lock()
+            .await
+            .entry(task_slice_id.task_id())
+            .and_modify(|x| {
+                x.slice_completed.insert(
+                    task_slice_id.slice_id(),
+                    (slice_completed_cache, HashSet::new()),
+                );
+            });
+        Ok(())
+    }
+    async fn create_task_slice_watch(
+        zk: Arc<ZooKeeper>,
+        opr_tx: UnboundedSender<OperationEvent>,
+        task_id: TaskId,
+        tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+    ) -> anyhow::Result<()> {
+        let task_data: TaskControlInfo =
+            serde_json::from_slice(&zk.get_data(&task_id.to_path(), false).await?.0)?;
+        iter(0..task_data.slice_num).for_each_concurrent(0, |i| {
+            let opr_tx_clone = opr_tx.clone();
+            let zk_clone = zk.clone();
+            let tasks_data_cache_clone = tasks_data_cache.clone();
+            async move {
+                Self::create_one_slice_watch(
+                    zk_clone,
+                    opr_tx_clone,
+                    TaskSliceId::from_task_slice(task_id, i.into()),
+                    tasks_data_cache_clone
+                )
+                .await.unwrap();
+            }
+        }).await;
+        Ok(())
+    }
+
+    async fn create_queue_cache_watch(
+        zk: Arc<ZooKeeper>,
+        opr_tx: UnboundedSender<OperationEvent>,
+    ) -> anyhow::Result<PathChildrenCache> {
+        let cache = PathChildrenCache::new(zk, TASKS_QUEUE_ROOT).await?;
+        cache.add_listener(move |event| {
+            let mut id_map = HashMap::new();
+            match event {
+                PathChildrenCacheEvent::ChildAdded(p, data) => {
+                    let task_id = serde_json::from_slice(&data.0).expect("invalid data");
+                    id_map.insert(p, task_id);
+                    let _ = opr_tx.send(OperationEvent::TaskPublished(task_id));
+                }
+                PathChildrenCacheEvent::ChildRemoved(p) => {
+                    if let Some(task_id) = id_map.remove(&p) {
+                        let _ = opr_tx.send(OperationEvent::TaskCompleted(task_id));
+                    }
+                }
+                _ => {}
             }
         });
         Ok(cache)
     }
-    async fn operation_sender(&self) ->UnboundedSender<OperationEvent> {
+    async fn operation_sender(&self) -> UnboundedSender<OperationEvent> {
         self.opr_tx.clone()
     }
 }
 
-
 mod test_zk_mng {
-    use crate::ZkMng;
+    use crate::{ZkMng, zk_mng::{TASKS_PATH, TaskSliceId}};
 
     const ZK_ADDR: &str = "127.0.0.1:2181";
     #[tokio::main]
     #[test]
     async fn test_connect() {
         let zk_mng = ZkMng::connect(ZK_ADDR).await.unwrap();
+        let task = zk_mng.new_task(10, super::TaskType::Spread).await.unwrap();
+        zk_mng.publish_task(task).await.unwrap();
     }
 }
