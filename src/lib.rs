@@ -1,8 +1,10 @@
+extern crate log;
 mod zk_mng;
+mod task;
+mod p2p_task;
+mod schedular;
+mod dummy_task;
 pub use zk_mng::ZkMng;
-mod test {
-    #[test]
-    fn test_connect() {
-        
-    }
-}
+pub use schedular::Schedular;
+pub use dummy_task::DummyTaskBehaviour;
+pub use zk_mng::TaskType;
