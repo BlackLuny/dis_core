@@ -178,6 +178,9 @@ impl TaskControlInfo {
     pub fn slice_num(&self) -> usize {
         self.slice_num
     }
+    pub fn workers_wanted(&self) ->Option<usize> {
+        self.workers_wanted.clone()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +346,7 @@ impl ZkMng {
                     cb(ZkEvent::TaskSliceCompleted(task_slice_id, worker_id))
                 }
                 OperationEvent::SliceCompletedDeleted(task_slice_id, worker_id) => {
-                    unimplemented!();
+                    
                 }
                 OperationEvent::TaskPublished(task_id) => {
                     let mut lock = tasks_data_cache.lock().await;

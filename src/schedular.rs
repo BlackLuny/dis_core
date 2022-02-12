@@ -13,13 +13,19 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 struct TaskData {
     slices_data: HashMap<SliceId, SliceData>,
+    progress_info: Option<HashMap<WorkerId, HashSet<SliceId>>>, // 哪些worker完成了多少切片
     slices_num: usize,
+    wanted_workers: Option<usize>,
+    completed_worker_num: usize,
 }
 impl TaskData {
-    fn new(slices_num: usize) -> Self {
+    fn new(slices_num: usize, wanted_workers: Option<usize>) -> Self {
         Self {
             slices_num,
+            wanted_workers,
+            progress_info: Default::default(),
             slices_data: Default::default(),
+            completed_worker_num: 0,
         }
     }
 }
@@ -49,7 +55,7 @@ pub struct Schedular<B> {
 }
 
 enum OperationEvent {
-    PublishTask(TaskId, usize, oneshot::Sender<anyhow::Result<()>>),
+    PublishTask(TaskId, usize, Option<usize>, oneshot::Sender<anyhow::Result<()>>),
     TaskInQueue(TaskId),
     TryProc(TaskSliceId, WorkerId),
 }
@@ -103,7 +109,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
             .await?;
         let (tx, rx) = oneshot::channel();
         self.opr_tx
-            .send(OperationEvent::PublishTask(task_id, slice_num, tx))
+            .send(OperationEvent::PublishTask(task_id, slice_num, workers_wanted, tx))
             .map_err(|e| anyhow!("send error: {}", e))?;
         rx.await?
     }
@@ -117,7 +123,9 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         let task_id = task_slice_id.task_id();
         let slice_id = task_slice_id.slice_id();
         let mut lock = tasks_data.lock().await;
-        let task_data = lock.get_mut(&task_id).ok_or(anyhow!("task_id:{} data is not existed", task_id.id()))?;
+        let task_data = lock
+            .get_mut(&task_id)
+            .ok_or(anyhow!("task_id:{} data is not existed", task_id.id()))?;
         let slice_data = task_data.slices_data.entry(slice_id).or_default();
         slice_data.status = SliceStatus::Completed;
         Ok(())
@@ -130,7 +138,9 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         let task_id = task_slice_id.task_id();
         let slice_id = task_slice_id.slice_id();
         let mut lock = tasks_data.lock().await;
-        let task_data = lock.get_mut(&task_id).ok_or(anyhow!("task_id:{} data is not existed", task_id.id()))?;
+        let task_data = lock
+            .get_mut(&task_id)
+            .ok_or(anyhow!("task_id:{} data is not existed", task_id.id()))?;
         let slice_data = task_data.slices_data.entry(slice_id).or_default();
         slice_data.status = SliceStatus::InCompleted;
         let mut completed_workers = slice_data.completed_workers.take().unwrap_or_default();
@@ -176,13 +186,20 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
 
         Ok(())
     }
-    async fn report_all_slice_completed(zk_mng: Arc<ZkMng>, task_id: TaskId, slice_num: usize){
-        iter(0..slice_num).for_each_concurrent(0, |x| {
-            let zk_mng_clone = zk_mng.clone();
-            async move {
-                let _ = zk_mng_clone.report_task_slice_completed(TaskSliceId::from_task_slice(task_id, x.into())).await;
-            }
-        }).await;
+    async fn report_all_slice_completed(zk_mng: Arc<ZkMng>, task_id: TaskId, slice_num: usize) {
+        iter(0..slice_num)
+            .for_each_concurrent(0, |x| {
+                let zk_mng_clone = zk_mng.clone();
+                async move {
+                    let _ = zk_mng_clone
+                        .report_task_slice_completed(TaskSliceId::from_task_slice(
+                            task_id,
+                            x.into(),
+                        ))
+                        .await;
+                }
+            })
+            .await;
     }
     async fn opr_proc(
         mut opr_rx: mpsc::UnboundedReceiver<OperationEvent>,
@@ -193,8 +210,11 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
     ) {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
-                OperationEvent::PublishTask(task_id, slice_num, sender) => {
-                    tasks_data.lock().await.insert(task_id, TaskData::new(slice_num));
+                OperationEvent::PublishTask(task_id, slice_num, wanted_works, sender) => {
+                    tasks_data
+                        .lock()
+                        .await
+                        .insert(task_id, TaskData::new(slice_num, wanted_works));
                     if let Err(e) = zk_mng.publish_task(task_id).await {
                         sender
                             .send(Err(anyhow!("publish task error: {}", e)))
@@ -208,7 +228,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                     let mut lock = tasks_data.lock().await;
                     if let Entry::Vacant(e) = lock.entry(task_id) {
                         if let Ok(task_ctrl_info) = zk_mng.get_task_ctrl_info(task_id).await {
-                            e.insert(TaskData::new(task_ctrl_info.slice_num()));
+                            e.insert(TaskData::new(task_ctrl_info.slice_num(), task_ctrl_info.workers_wanted()));
                         }
                     }
                 }
@@ -223,6 +243,31 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                 }
             }
         }
+    }
+    async fn record_task_slice_completed(
+        tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+        task_slice_id: TaskSliceId,
+        worker_id: WorkerId,
+    ) -> anyhow::Result<bool> {
+        let mut lock = tasks_data.lock().await;
+        let task_data = lock.get_mut(&task_slice_id.task_id()).ok_or(anyhow!("Can't find tasks"))?;
+        let mut progress_info = task_data.progress_info.take().unwrap_or_default();
+        let worker_entry = progress_info.entry(worker_id).or_default();
+        worker_entry.insert(task_slice_id.slice_id());
+        if worker_entry.len() == task_data.slices_num {
+            task_data.completed_worker_num += 1;
+        }
+        task_data.progress_info = Some(progress_info);
+        // 判断是否所有的worker都完成了
+        if let Some(wanted) = task_data.wanted_workers {
+            if task_data.completed_worker_num == wanted {
+                return Ok(true);
+            }
+        } else {
+            // 所有都要完成
+            unimplemented!()
+        }
+        Ok(false)
     }
     async fn proc_zk_event(
         zk_mng: Arc<ZkMng>,
@@ -242,12 +287,28 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                     if worker_id == zk_mng.self_id() {
                         continue;
                     }
-                    if published_tasks.lock().await.get(&task_slice_id.task_id()).is_none() {
+                    if published_tasks
+                        .lock()
+                        .await
+                        .get(&task_slice_id.task_id())
+                        .is_none()
+                    {
                         println!("try work: {:?}, from {}", task_slice_id, worker_id.id());
                         let _ = opr_tx.send(OperationEvent::TryProc(task_slice_id, worker_id));
                     } else {
                         // 判断task是否完成
-                        println!("recv task slice completed: {}, {:?}", worker_id.id(), task_slice_id);
+                        println!(
+                            "recv task slice completed: {}, {:?}",
+                            worker_id.id(),
+                            task_slice_id
+                        );
+                        if Self::record_task_slice_completed(tasks_data.clone(), task_slice_id, worker_id).await.expect("record must success") {
+                            // 任务结束
+                            if let Some(tx) = published_tasks.lock().await.remove(&task_slice_id.task_id()) {
+                                tx.send(Ok(())).unwrap();
+                            }
+                        }
+
                     }
                 }
                 ZkEvent::WorkerAdded(worker_id) => {}
@@ -287,7 +348,7 @@ mod test {
             .await
             .first()
             .unwrap()
-            .spawn_task(1, TaskType::Spread, Some(10))
+            .spawn_task(1, TaskType::Spread, Some(49))
             .await
             .unwrap();
     }
