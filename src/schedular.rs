@@ -398,8 +398,8 @@ mod test_schedular {
     #[test]
     async fn test1() {
         let all_client = Arc::new(Mutex::new(Vec::new()));
-        for _ in 0..20 {
-            iter(0..100)
+        for _ in 0..40 {
+            iter(0..50)
                 .for_each_concurrent(0, |i| {
                     let all_client_clone = all_client.clone();
                     async move {
