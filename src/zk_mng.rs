@@ -11,7 +11,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, Mutex};
 use zookeeper_async::recipes::cache::{PathChildrenCache, PathChildrenCacheEvent};
-use zookeeper_async::{Acl, CreateMode, ZkError, ZooKeeper, ZooKeeperExt};
+use zookeeper_async::{Acl, CreateMode, Stat, ZkError, ZooKeeper, ZooKeeperExt};
 
 const TASKS_ROOT: &str = "/tasks";
 const TASKS_PATH: &str = concat!(TASKS_ROOT, "/task");
@@ -151,35 +151,80 @@ pub enum TaskType {
     Spread, // 传播型，可以从其他worker获取任务
     Hosted, // 只能从Host获取任务
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum TaskWorkerWanted {
+    AllWorker,
+    Explicit {
+        workers_wanted: usize,
+        worker_lst: HashSet<WorkerId>,
+    },
+}
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TaskControlInfo {
     publisher: WorkerId,
     slice_num: usize,
     task_type: TaskType,
-    workers_wanted: Option<usize>, // 需要的worker数量， None代表所有的worker都需要完成
+    workers_wanted: TaskWorkerWanted,
     status: TaskStatus,
 }
 
 impl TaskControlInfo {
-    fn new(
+    fn new_explict(
         publisher: WorkerId,
         slice_num: usize,
         task_type: TaskType,
-        workers_wanted: Option<usize>,
+        workers_wanted: usize,
     ) -> Self {
         Self {
             publisher,
             slice_num,
             task_type,
-            workers_wanted,
+            workers_wanted: TaskWorkerWanted::Explicit {
+                workers_wanted: workers_wanted,
+                worker_lst: Default::default(),
+            },
+            status: TaskStatus::Initing,
+        }
+    }
+    fn new_all_workers(publisher: WorkerId, slice_num: usize, task_type: TaskType) -> Self {
+        Self {
+            publisher,
+            slice_num,
+            task_type,
+            workers_wanted: TaskWorkerWanted::AllWorker,
             status: TaskStatus::Initing,
         }
     }
     pub fn slice_num(&self) -> usize {
         self.slice_num
     }
-    pub fn workers_wanted(&self) ->Option<usize> {
-        self.workers_wanted.clone()
+    pub fn task_type(&self) -> TaskType {
+        self.task_type
+    }
+    pub fn workers_wanted(&self) -> Option<usize> {
+        match self.workers_wanted {
+            TaskWorkerWanted::AllWorker => None,
+            TaskWorkerWanted::Explicit{workers_wanted, ..} => Some(workers_wanted)
+        }
+    }
+    pub fn is_all_worker_do(&self) -> bool {
+        matches!(self.workers_wanted, TaskWorkerWanted::AllWorker)
+    }
+    pub fn add_worker(&mut self, worker_id: WorkerId) {
+        match self.workers_wanted {
+            TaskWorkerWanted::Explicit{ref mut worker_lst, ..} => {worker_lst.insert(worker_id);}
+            _ => {}
+        }
+    }
+    pub fn get_worker_list(&self) -> Option<&HashSet<WorkerId>> {
+        match self.workers_wanted {
+            TaskWorkerWanted::Explicit{ref worker_lst, ..} => {Some(worker_lst)}
+            _ => {None}
+        }
+    }
+    pub fn cur_worker_list(&self) -> Option<usize> {
+        self.get_worker_list().map(|x| x.len())
     }
 }
 
@@ -225,6 +270,7 @@ enum OperationEvent {
     AddTaskDataWatcher(TaskId),
     RmvTaskDataWatcher(TaskId),
     TaskPublished(TaskId),
+    TaskGetted(TaskId, TaskType),
     TaskCompleted(TaskId),
     TaskPublish(TaskId, oneshot::Sender<anyhow::Result<()>>),
     SliceCompleted(TaskSliceId, WorkerId),
@@ -331,6 +377,7 @@ impl ZkMng {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
                 OperationEvent::AddTaskDataWatcher(task_id) => {
+                    info!("add task watch");
                     let _ = Self::create_task_slice_watch(
                         zk.clone(),
                         opr_tx.clone(),
@@ -340,33 +387,34 @@ impl ZkMng {
                     .await;
                 }
                 OperationEvent::RmvTaskDataWatcher(task_id) => {
-                    unimplemented!();
+                    info!("task_id: {} watcher removed", task_id.id());
+                    tasks_data_cache
+                        .lock()
+                        .await
+                        .remove(&task_id)
+                        .expect("should existed");
                 }
                 OperationEvent::SliceCompleted(task_slice_id, worker_id) => {
                     cb(ZkEvent::TaskSliceCompleted(task_slice_id, worker_id))
                 }
-                OperationEvent::SliceCompletedDeleted(task_slice_id, worker_id) => {
-                    
-                }
-                OperationEvent::TaskPublished(task_id) => {
+                OperationEvent::SliceCompletedDeleted(task_slice_id, worker_id) => {}
+                OperationEvent::TaskGetted(task_id, task_type) => {
                     let mut lock = tasks_data_cache.lock().await;
                     if let Entry::Vacant(e) = lock.entry(task_id) {
                         // 自己是worker
                         e.insert(TaskData::new());
                         drop(lock);
-                        if let Ok((d, _)) = zk.get_data(&task_id.to_path(), false).await {
-                            if let Ok(task_data) = serde_json::from_slice::<TaskControlInfo>(&d) {
-                                match task_data.task_type {
-                                    TaskType::Spread => {
-                                        let _ = opr_tx
-                                            .send(OperationEvent::AddTaskDataWatcher(task_id));
-                                    }
-                                    TaskType::Hosted => {}
-                                }
-                                cb(ZkEvent::TaskPublished(task_id));
+                        // todo 逻辑移动到schedular
+                        match task_type {
+                            TaskType::Spread => {
+                                let _ = opr_tx.send(OperationEvent::AddTaskDataWatcher(task_id));
                             }
+                            TaskType::Hosted => {}
                         }
                     }
+                }
+                OperationEvent::TaskPublished(task_id) => {
+                    cb(ZkEvent::TaskPublished(task_id));
                 }
                 OperationEvent::TaskCompleted(task_id) => {
                     tasks_data_cache.lock().await.remove(&task_id);
@@ -376,7 +424,10 @@ impl ZkMng {
                     }
                 }
                 OperationEvent::TaskPublish(task_id, tx) => {
-                    tasks_data_cache.lock().await.insert(task_id, TaskData::new());
+                    tasks_data_cache
+                        .lock()
+                        .await
+                        .insert(task_id, TaskData::new());
                     // 必须要先添加监控，然后再入队，否则可能重复添加
                     if let Err(e) = Self::create_task_slice_watch(
                         zk.clone(),
@@ -410,8 +461,11 @@ impl ZkMng {
         task_type: TaskType,
         workers_wanted: Option<usize>,
     ) -> anyhow::Result<TaskId> {
-        let task_ctrl_info =
-            TaskControlInfo::new(self.self_id, slice_num, task_type, workers_wanted);
+        let task_ctrl_info = match workers_wanted {
+            Some(workers_wanted) => TaskControlInfo::new_explict(self.self_id, slice_num, task_type, workers_wanted),
+            None => TaskControlInfo::new_all_workers(self.self_id, slice_num, task_type)
+        };
+            
         let mode = match task_type {
             TaskType::Hosted => CreateMode::EphemeralSequential,
             TaskType::Spread => CreateMode::PersistentSequential,
@@ -450,6 +504,11 @@ impl ZkMng {
             .map_err(|e| anyhow!("send error: {}", e))?;
         rx.await?
     }
+    pub async fn remove_task_slice_watch(&self, task_id: TaskId) {
+        let _ = self
+            .opr_tx
+            .send(OperationEvent::RmvTaskDataWatcher(task_id));
+    }
 
     pub async fn report_task_slice_completed(
         &self,
@@ -472,10 +531,38 @@ impl ZkMng {
         Ok(())
     }
 
-    pub async fn get_task_ctrl_info(&self, task_id: TaskId) -> anyhow::Result<TaskControlInfo> {
-        let d = self.zk.get_data(&task_id.to_path(), false).await?.0;
-        serde_json::from_slice(&d).map_err(|e| anyhow!("deserialize failed: {}", e))
+    pub async fn get_task_ctrl_info(
+        &self,
+        task_id: TaskId,
+    ) -> anyhow::Result<(TaskControlInfo, i32)> {
+        let (d, Stat { version, .. }) = self.zk.get_data(&task_id.to_path(), false).await?;
+        Ok((
+            serde_json::from_slice(&d).map_err(|e| anyhow!("deserialize failed: {}", e))?,
+            version,
+        ))
     }
+
+    pub async fn try_set_task_ctrl_info(
+        &self,
+        task_id: TaskId,
+        task_ctrl_info: &TaskControlInfo,
+        version: i32,
+    ) -> anyhow::Result<bool> {
+        let r = self
+            .zk
+            .set_data(
+                &task_id.to_path(),
+                serde_json::to_vec(task_ctrl_info)?,
+                Some(version),
+            )
+            .await;
+        match r {
+            Err(ZkError::BadVersion) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(e) => Err(anyhow!("other error: {}", e)),
+        }
+    }
+
     async fn set_task_ctrl_info(
         &self,
         task_id: TaskId,
@@ -493,16 +580,21 @@ impl ZkMng {
     }
 
     pub async fn get_task_status(&self, task_id: TaskId) -> anyhow::Result<TaskStatus> {
-        let ctrl_info = self.get_task_ctrl_info(task_id).await?;
+        let (ctrl_info, _) = self.get_task_ctrl_info(task_id).await?;
         Ok(ctrl_info.status)
     }
     pub async fn set_task_status(&self, task_id: TaskId, status: TaskStatus) -> anyhow::Result<()> {
-        let mut ctrl_info = self.get_task_ctrl_info(task_id).await?;
+        let (mut ctrl_info, _) = self.get_task_ctrl_info(task_id).await?;
         ctrl_info.status = status;
         self.set_task_ctrl_info(task_id, &ctrl_info).await
     }
-    pub async fn report_task_completed(&self, task_id: TaskId) {
+    pub fn report_task_completed(&self, task_id: TaskId) {
         let _ = self.opr_tx.send(OperationEvent::TaskCompleted(task_id));
+    }
+    pub fn task_getted(&self, task_id: TaskId, task_type: TaskType) {
+        let _ = self
+            .opr_tx
+            .send(OperationEvent::TaskGetted(task_id, task_type));
     }
     async fn create_one_slice_watch(
         zk: Arc<ZooKeeper>,
@@ -609,7 +701,7 @@ impl ZkMng {
             }
             _ => {}
         });
-        cache.start()?;
+        //cache.start()?;
         Ok(cache)
     }
     async fn operation_sender(&self) -> UnboundedSender<OperationEvent> {
@@ -643,7 +735,7 @@ mod test_zk_mng {
                 .await
                 .unwrap();
         }
-        zk_mng.report_task_completed(task).await;
+        zk_mng.report_task_completed(task);
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 
@@ -667,7 +759,7 @@ mod test_zk_mng {
                 .await
                 .unwrap();
         }
-        zk_mng.report_task_completed(task).await;
+        zk_mng.report_task_completed(task);
     }
 
     #[tokio::main]

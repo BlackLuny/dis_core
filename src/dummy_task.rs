@@ -9,7 +9,7 @@ pub struct DummyTaskBehaviour{}
 #[async_trait]
 impl TaskBehaviour for DummyTaskBehaviour {
     async fn try_work(&self, task_slice: TaskSliceId, worker: WorkerAddress) ->anyhow::Result<TaskResult> {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        //tokio::time::sleep(Duration::from_secs(2)).await;
         Ok(TaskResult::Completed)
     }
     async fn get_address(&self) -> WorkerAddress {
