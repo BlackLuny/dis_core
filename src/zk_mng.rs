@@ -9,12 +9,14 @@ use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender, self};
+use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, Mutex};
 use zookeeper_async::recipes::cache::{PathChildrenCache, PathChildrenCacheEvent};
-use zookeeper_async::{Acl, CreateMode, Stat, ZkError, ZooKeeper, ZooKeeperExt, WatchedEvent, WatchedEventType};
+use zookeeper_async::{
+    Acl, CreateMode, Stat, WatchedEvent, WatchedEventType, ZkError, ZooKeeper, ZooKeeperExt,
+};
 
-use crate::pull_path_cache::PullPathCache;
+use crate::node_cache::{NodeCache, NodeCacheEvent};
 
 const TASKS_ROOT: &str = "/tasks";
 const TASKS_PATH: &str = concat!(TASKS_ROOT, "/task");
@@ -123,18 +125,6 @@ impl WorkerId {
     }
 }
 
-struct TaskData {
-    slice_completed: HashMap<SliceId, PathChildrenCache>, // 完成了部分切片的worker
-}
-
-impl TaskData {
-    fn new() -> Self {
-        Self {
-            slice_completed: HashMap::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum WorkerStatus {
     Idle,
@@ -208,7 +198,7 @@ impl TaskControlInfo {
     pub fn workers_wanted(&self) -> Option<usize> {
         match self.workers_wanted {
             TaskWorkerWanted::AllWorker => None,
-            TaskWorkerWanted::Explicit{workers_wanted, ..} => Some(workers_wanted)
+            TaskWorkerWanted::Explicit { workers_wanted, .. } => Some(workers_wanted),
         }
     }
     pub fn is_all_worker_do(&self) -> bool {
@@ -216,14 +206,18 @@ impl TaskControlInfo {
     }
     pub fn add_worker(&mut self, worker_id: WorkerId) {
         match self.workers_wanted {
-            TaskWorkerWanted::Explicit{ref mut worker_lst, ..} => {worker_lst.insert(worker_id);}
+            TaskWorkerWanted::Explicit {
+                ref mut worker_lst, ..
+            } => {
+                worker_lst.insert(worker_id);
+            }
             _ => {}
         }
     }
     pub fn get_worker_list(&self) -> Option<&HashSet<WorkerId>> {
         match self.workers_wanted {
-            TaskWorkerWanted::Explicit{ref worker_lst, ..} => {Some(worker_lst)}
-            _ => {None}
+            TaskWorkerWanted::Explicit { ref worker_lst, .. } => Some(worker_lst),
+            _ => None,
         }
     }
     pub fn cur_worker_list(&self) -> Option<usize> {
@@ -241,7 +235,7 @@ impl WorkerAddress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerData {
+pub struct WorkerData {
     status: WorkerStatus,
     address: WorkerAddress,
 }
@@ -264,29 +258,31 @@ impl WorkerData {
 pub struct ZkMng {
     zk: Arc<ZooKeeper>,
     self_id: WorkerId,
-    task_queue_cache: Arc<Mutex<(PathChildrenCache, HashMap<TaskId, String>)>>,
-    tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
-    worker_data_cache: Arc<Mutex<(PullPathCache, HashMap<WorkerId, WorkerData>)>>,
+    task_queue_cache: Arc<PathChildrenCache>,
+    tasks_data_cache: Arc<Mutex<HashMap<TaskId, HashMap<SliceId, PathChildrenCache>>>>,
+    worker_data_cache: Arc<Mutex<(HashMap<WorkerId, NodeCache>)>>,
     opr_tx: UnboundedSender<OperationEvent>,
 }
 enum OperationEvent {
     AddTaskDataWatcher(TaskId),
     RmvTaskDataWatcher(TaskId),
+    AddWorkerWatcher(WorkerId),
+    RmvWorkerWatcher(WorkerId),
     TaskPublished(TaskId),
     TaskGetted(TaskId, TaskType),
     TaskCompleted(TaskId),
     TaskPublish(TaskId, oneshot::Sender<anyhow::Result<()>>),
     SliceCompleted(TaskSliceId, WorkerId),
     SliceCompletedDeleted(TaskSliceId, WorkerId),
-    WorkerAdded(WorkerId),
     WorkerDeleted(WorkerId),
+    WorkerDataUpdated(WorkerId, WorkerData),
 }
 
 pub enum ZkEvent {
     TaskPublished(TaskId),
     TaskCompleted(TaskId),
     TaskSliceCompleted(TaskSliceId, WorkerId),
-    WorkerAdded(WorkerId),
+    WorkerDataUpdated(WorkerId, WorkerData),
     WorkerDeleted(WorkerId),
 }
 
@@ -314,15 +310,10 @@ impl ZkMng {
 
         let (opr_tx, opr_rx) = unbounded_channel();
 
-        let task_queue_cache = Arc::new(Mutex::new((
-            Self::create_queue_cache_watch(zk.clone(), opr_tx.clone()).await?,
-            HashMap::new(),
-        )));
+        let task_queue_cache =
+            Arc::new(Self::create_queue_cache_watch(zk.clone(), opr_tx.clone()).await?);
         let tasks_data_cache = Arc::new(Mutex::new(HashMap::new()));
-        let worker_data_cache = Arc::new(Mutex::new((
-            Self::create_worker_cache_watch(zk.clone(), opr_tx.clone()).await?,
-            HashMap::new(),
-        )));
+        let worker_data_cache = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(Self::opr_event_proc(
             zk.clone(),
@@ -331,6 +322,7 @@ impl ZkMng {
             opr_rx,
             tasks_data_cache.clone(),
             task_queue_cache.clone(),
+            worker_data_cache.clone(),
         ));
 
         Ok(Self {
@@ -345,23 +337,33 @@ impl ZkMng {
     pub fn self_id(&self) -> WorkerId {
         self.self_id
     }
-    async fn task_in_queue(zk: Arc<ZooKeeper>, task_id: TaskId) -> anyhow::Result<String> {
+    async fn task_in_queue(zk: Arc<ZooKeeper>, task_id: TaskId) -> anyhow::Result<()> {
+        let p = format!("{}{:0width$}", TASKS_QUEUE_PATH, task_id.id(), width = 10);
         zk.create(
             TASKS_QUEUE_PATH,
             bincode::serialize(&task_id)?,
             Acl::open_unsafe().clone(),
-            CreateMode::EphemeralSequential,
+            CreateMode::Ephemeral,
         )
-        .await
-        .map_err(|e| anyhow!("in queue error: {}", e))
+        .await?;
+        Ok(())
     }
-    async fn task_out_queue(zk: Arc<ZooKeeper>, task_queue_path: &str) -> anyhow::Result<()> {
-        zk.delete(task_queue_path, None)
+    async fn task_out_queue(zk: Arc<ZooKeeper>, task_id: TaskId) -> anyhow::Result<()> {
+        let p = format!("{}{:0width$}", TASKS_QUEUE_PATH, task_id.id(), width = 10);
+        zk.delete(&p, None)
             .await
             .map_err(|e| anyhow!("out queue error: {}", e))
     }
     pub async fn get_worker_address(&self, worker_id: WorkerId) -> anyhow::Result<WorkerAddress> {
-        if let Some(worker_data) = self.worker_data_cache.lock().await.1.get(&worker_id) {
+        let worker_data = {
+            match self.worker_data_cache.lock().await.get(&worker_id) {
+                Some(n) => {
+                    n.get_current_data().await.and_then(|x|bincode::deserialize::<WorkerData>(&x.0).ok())
+                }
+                None => None
+            }
+        };
+        if let Some(worker_data) = worker_data {
             Ok(worker_data.address.clone())
         } else {
             let (d, _) = self.zk.get_data(&worker_id.to_path(), false).await?;
@@ -374,8 +376,9 @@ impl ZkMng {
         mut cb: impl FnMut(ZkEvent),
         opr_tx: UnboundedSender<OperationEvent>,
         mut opr_rx: UnboundedReceiver<OperationEvent>,
-        tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
-        task_queue_cache: Arc<Mutex<(PathChildrenCache, HashMap<TaskId, String>)>>,
+        tasks_data_cache: Arc<Mutex<HashMap<TaskId, HashMap<SliceId, PathChildrenCache>>>>,
+        task_queue_cache: Arc<PathChildrenCache>,
+        worker_data_cache: Arc<Mutex<HashMap<WorkerId, NodeCache>>>,
     ) {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
@@ -397,6 +400,12 @@ impl ZkMng {
                         .remove(&task_id)
                         .expect("should existed");
                 }
+                OperationEvent::AddWorkerWatcher(worker_id) => {
+
+                }
+                OperationEvent::RmvWorkerWatcher(worker_id) => {
+
+                }
                 OperationEvent::SliceCompleted(task_slice_id, worker_id) => {
                     cb(ZkEvent::TaskSliceCompleted(task_slice_id, worker_id))
                 }
@@ -405,7 +414,7 @@ impl ZkMng {
                     let mut lock = tasks_data_cache.lock().await;
                     if let Entry::Vacant(e) = lock.entry(task_id) {
                         // 自己是worker
-                        e.insert(TaskData::new());
+                        e.insert(HashMap::new());
                         drop(lock);
                         // todo 逻辑移动到schedular
                         match task_type {
@@ -421,16 +430,14 @@ impl ZkMng {
                 }
                 OperationEvent::TaskCompleted(task_id) => {
                     tasks_data_cache.lock().await.remove(&task_id);
-                    if let Some(p) = task_queue_cache.lock().await.1.remove(&task_id) {
-                        let _ = Self::task_out_queue(zk.clone(), &p).await;
-                        cb(ZkEvent::TaskCompleted(task_id));
-                    }
+                    let _ = Self::task_out_queue(zk.clone(), task_id).await;
+                    cb(ZkEvent::TaskCompleted(task_id));
                 }
                 OperationEvent::TaskPublish(task_id, tx) => {
                     tasks_data_cache
                         .lock()
                         .await
-                        .insert(task_id, TaskData::new());
+                        .insert(task_id, HashMap::new());
                     // 必须要先添加监控，然后再入队，否则可能重复添加
                     if let Err(e) = Self::create_task_slice_watch(
                         zk.clone(),
@@ -444,13 +451,11 @@ impl ZkMng {
                             .unwrap();
                         continue;
                     }
-                    if let Ok(p) = Self::task_in_queue(zk.clone(), task_id).await {
-                        task_queue_cache.lock().await.1.insert(task_id, p);
-                    }
-                    tx.send(Ok(())).unwrap()
+                    let r = Self::task_in_queue(zk.clone(), task_id).await;
+                    tx.send(r).unwrap()
                 }
-                OperationEvent::WorkerAdded(worker_id) => {
-                    cb(ZkEvent::WorkerAdded(worker_id));
+                OperationEvent::WorkerDataUpdated(worker_id, data) => {
+                    cb(ZkEvent::WorkerDataUpdated(worker_id, data));
                 }
                 OperationEvent::WorkerDeleted(worker_id) => {
                     cb(ZkEvent::WorkerDeleted(worker_id));
@@ -465,10 +470,12 @@ impl ZkMng {
         workers_wanted: Option<usize>,
     ) -> anyhow::Result<TaskId> {
         let task_ctrl_info = match workers_wanted {
-            Some(workers_wanted) => TaskControlInfo::new_explict(self.self_id, slice_num, task_type, workers_wanted),
-            None => TaskControlInfo::new_all_workers(self.self_id, slice_num, task_type)
+            Some(workers_wanted) => {
+                TaskControlInfo::new_explict(self.self_id, slice_num, task_type, workers_wanted)
+            }
+            None => TaskControlInfo::new_all_workers(self.self_id, slice_num, task_type),
         };
-            
+
         let mode = match task_type {
             TaskType::Hosted => CreateMode::EphemeralSequential,
             TaskType::Spread => CreateMode::PersistentSequential,
@@ -603,7 +610,7 @@ impl ZkMng {
         zk: Arc<ZooKeeper>,
         opr_tx: UnboundedSender<OperationEvent>,
         task_slice_id: TaskSliceId,
-        tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+        tasks_data_cache: Arc<Mutex<HashMap<TaskId, HashMap<SliceId, PathChildrenCache>>>>,
     ) -> anyhow::Result<()> {
         let mut slice_completed_cache =
             PathChildrenCache::new(zk, &task_slice_id.to_path()).await?;
@@ -630,8 +637,7 @@ impl ZkMng {
             .await
             .entry(task_slice_id.task_id())
             .and_modify(|x| {
-                x.slice_completed
-                    .insert(task_slice_id.slice_id(), slice_completed_cache);
+                x.insert(task_slice_id.slice_id(), slice_completed_cache);
             });
         Ok(())
     }
@@ -639,10 +645,10 @@ impl ZkMng {
         zk: Arc<ZooKeeper>,
         opr_tx: UnboundedSender<OperationEvent>,
         task_id: TaskId,
-        tasks_data_cache: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+        tasks_data_cache: Arc<Mutex<HashMap<TaskId, HashMap<SliceId, PathChildrenCache>>>>,
     ) -> anyhow::Result<()> {
         let task_data: TaskControlInfo =
-        bincode::deserialize(&zk.get_data(&task_id.to_path(), false).await?.0)?;
+            bincode::deserialize(&zk.get_data(&task_id.to_path(), false).await?.0)?;
         iter(0..task_data.slice_num)
             .for_each_concurrent(0, |i| {
                 let opr_tx_clone = opr_tx.clone();
@@ -687,95 +693,20 @@ impl ZkMng {
 
     async fn create_worker_cache_watch(
         zk: Arc<ZooKeeper>,
+        worker_id: WorkerId,
         opr_tx: UnboundedSender<OperationEvent>,
-    ) -> anyhow::Result<PullPathCache> {
-        //let mut cache = PathChildrenCache::new(zk.clone(), WORKER_ROOT).await?;
-        //let id_map = std::sync::Mutex::new(HashMap::new());
-        // cache.add_listener(move |event| match event {
-        //     PathChildrenCacheEvent::ChildAdded(p, _) => {
-        //         let worker_id = WorkerId::from_path(&p).unwrap();
-        //         id_map.lock().unwrap().insert(p, worker_id);
-        //         let _ = opr_tx.send(OperationEvent::WorkerAdded(worker_id));
-        //     }
-        //     PathChildrenCacheEvent::ChildRemoved(p) => {
-        //         if let Some(worker_id) = id_map.lock().unwrap().remove(&p) {
-        //             let _ = opr_tx.send(OperationEvent::WorkerDeleted(worker_id));
-        //         }
-        //     }
-        //     _ => {}
-        // });
-        //cache.start()?;
-        // 自己实现的监控
-        // let (tx, mut rx) = mpsc::unbounded_channel();
-        // let tx_clone = tx.clone();
-        // let watcher = move |evt| {
-        //     let _ = tx_clone.send(evt);
-        // };
-        // let _ = zk.get_children_w(WORKER_ROOT, watcher).await;
-        // let zk_clone = zk.clone();
-        // let tx_clone = tx.clone();
-        // tokio::spawn(async move {
-        //     let mut children_data = HashSet::new();
-        //     while let Some(evt) = rx.recv().await {
-        //         match evt {
-        //             WatchedEvent {event_type: WatchedEventType::NodeChildrenChanged, ..} => {
-        //                 let data = zk_clone.get_children(WORKER_ROOT, false).await.unwrap();
-        //                 for child in data {
-        //                     if children_data.get(&child).is_none() {
-        //                         let child_data = zk_clone.get_data(&format!("{}/{}", WORKER_ROOT, child), false).await.unwrap();
-        //                         children_data.insert(child);
-        //                     }
-
-        //                 }
-        //             }
-        //             _ => {}
-        //         }
-        //         let tx_clone2 =  tx_clone.clone();
-        //         let watcher = move |evt| {
-        //             let _ = tx_clone2.clone().send(evt);
-        //         };
-                
-        //         tokio::time::sleep(Duration::from_secs(5)).await;
-        //         let _ = zk_clone.get_children_w(WORKER_ROOT, watcher).await;
-                
-        //     }
-        // });
-        // let (tx, mut rx) = mpsc::unbounded_channel();
-        // let tx_clone = tx.clone();
-        // let watcher = move |evt| {
-        //     let _ = tx_clone.send(evt);
-        // };
-        // let _ = zk.get_children_w(WORKER_ROOT, watcher).await;
-        // let zk_clone = zk.clone();
-        // let tx_clone = tx.clone();
-        // let zk_clone = zk.clone();
-        // tokio::spawn(async move {
-        //     let mut children_data = HashSet::new();
-        //     loop {
-        //         tokio::time::sleep(Duration::from_secs(5)).await;
-        //         let data = zk_clone.get_children(WORKER_ROOT, false).await.unwrap();
-        //         for child in data {
-        //             if children_data.get(&child).is_none() {
-        //                 let child_data = zk_clone.get_data(&format!("{}/{}", WORKER_ROOT, child), false).await.unwrap();
-        //                 children_data.insert(child);
-        //             }
-        //         }
-        //     }
-        // });
+    ) -> anyhow::Result<NodeCache> {
         let listener = move |event| match event {
-            PathChildrenCacheEvent::ChildAdded(p, _) => {
-                // let worker_id = WorkerId::from_path(&p).unwrap();
-                // id_map.lock().unwrap().insert(p, worker_id);
-                // let _ = opr_tx.send(OperationEvent::WorkerAdded(worker_id));
+            NodeCacheEvent::DataUpdated(d) => {
+                let worker_data = bincode::deserialize(&d.0).unwrap();
+                let _ = opr_tx.send(OperationEvent::WorkerDataUpdated(worker_id, worker_data));
             }
-            PathChildrenCacheEvent::ChildRemoved(p) => {
-                // if let Some(worker_id) = id_map.lock().unwrap().remove(&p) {
-                //     let _ = opr_tx.send(OperationEvent::WorkerDeleted(worker_id));
-                // }
+            NodeCacheEvent::NodeDeleted => {
+                let _ = opr_tx.send(OperationEvent::WorkerDeleted(worker_id));
             }
-            _ => {}
+            NodeCacheEvent::Initialized(d) => {}
         };
-        let mut pull = PullPathCache::new(zk.clone(), WORKER_ROOT).await?;
+        let mut pull = NodeCache::new(zk.clone(), WORKER_ROOT).await?;
         pull.start(listener)?;
         Ok(pull)
     }

@@ -373,7 +373,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                         }
                     }
                 }
-                ZkEvent::WorkerAdded(worker_id) => {}
+                ZkEvent::WorkerDataUpdated(worker_id, worker_data) => {}
                 ZkEvent::WorkerDeleted(worekr_id) => {}
             }
         }
