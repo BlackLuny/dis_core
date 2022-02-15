@@ -7,6 +7,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;
+use std::fmt::format;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -287,6 +288,10 @@ pub enum ZkEvent {
 }
 
 impl ZkMng {
+    pub async fn debug_info(&self) {
+    println!("tasks_data_cache: {}", self.tasks_data_cache.lock().await.len());
+    println!("worker_data_cache: {}", self.worker_data_cache.lock().await.len());
+    }
     pub async fn connect(
         zk_addr: &str,
         callback: impl FnMut(ZkEvent) + 'static + Send + Sync,
@@ -340,7 +345,7 @@ impl ZkMng {
     async fn task_in_queue(zk: Arc<ZooKeeper>, task_id: TaskId) -> anyhow::Result<()> {
         let p = format!("{}{:0width$}", TASKS_QUEUE_PATH, task_id.id(), width = 10);
         zk.create(
-            TASKS_QUEUE_PATH,
+            &p,
             bincode::serialize(&task_id)?,
             Acl::open_unsafe().clone(),
             CreateMode::Ephemeral,
@@ -348,19 +353,20 @@ impl ZkMng {
         .await?;
         Ok(())
     }
-    async fn task_out_queue(zk: Arc<ZooKeeper>, task_id: TaskId) -> anyhow::Result<()> {
+    async fn task_out_queue(&self, task_id: TaskId) -> anyhow::Result<()> {
         let p = format!("{}{:0width$}", TASKS_QUEUE_PATH, task_id.id(), width = 10);
-        zk.delete(&p, None)
+        self.zk.delete(&p, None)
             .await
             .map_err(|e| anyhow!("out queue error: {}", e))
     }
     pub async fn get_worker_address(&self, worker_id: WorkerId) -> anyhow::Result<WorkerAddress> {
         let worker_data = {
             match self.worker_data_cache.lock().await.get(&worker_id) {
-                Some(n) => {
-                    n.get_current_data().await.and_then(|x|bincode::deserialize::<WorkerData>(&x.0).ok())
-                }
-                None => None
+                Some(n) => n
+                    .get_current_data()
+                    .await
+                    .and_then(|x| bincode::deserialize::<WorkerData>(&x.0).ok()),
+                None => None,
             }
         };
         if let Some(worker_data) = worker_data {
@@ -400,12 +406,8 @@ impl ZkMng {
                         .remove(&task_id)
                         .expect("should existed");
                 }
-                OperationEvent::AddWorkerWatcher(worker_id) => {
-
-                }
-                OperationEvent::RmvWorkerWatcher(worker_id) => {
-
-                }
+                OperationEvent::AddWorkerWatcher(worker_id) => {}
+                OperationEvent::RmvWorkerWatcher(worker_id) => {}
                 OperationEvent::SliceCompleted(task_slice_id, worker_id) => {
                     cb(ZkEvent::TaskSliceCompleted(task_slice_id, worker_id))
                 }
@@ -429,8 +431,8 @@ impl ZkMng {
                     cb(ZkEvent::TaskPublished(task_id));
                 }
                 OperationEvent::TaskCompleted(task_id) => {
+                    println!("task completed");
                     tasks_data_cache.lock().await.remove(&task_id);
-                    let _ = Self::task_out_queue(zk.clone(), task_id).await;
                     cb(ZkEvent::TaskCompleted(task_id));
                 }
                 OperationEvent::TaskPublish(task_id, tx) => {
@@ -514,10 +516,22 @@ impl ZkMng {
             .map_err(|e| anyhow!("send error: {}", e))?;
         rx.await?
     }
-    pub async fn remove_task_slice_watch(&self, task_id: TaskId) {
+    pub fn remove_task_slice_watch(&self, task_id: TaskId) {
         let _ = self
             .opr_tx
             .send(OperationEvent::RmvTaskDataWatcher(task_id));
+    }
+
+    pub fn add_worker_watch(&self, worker_id: WorkerId) {
+        let _ = self
+            .opr_tx
+            .send(OperationEvent::AddWorkerWatcher(worker_id));
+    }
+
+    pub fn rmv_worker_watch(&self, worker_id: WorkerId) {
+        let _ = self
+            .opr_tx
+            .send(OperationEvent::RmvWorkerWatcher(worker_id));
     }
 
     pub async fn report_task_slice_completed(
@@ -539,6 +553,30 @@ impl ZkMng {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn add_worker_to_task(
+        &self,
+        task_id: TaskId,
+    ) -> anyhow::Result<usize> {
+        let task_worker_path = format!("{}/workers", task_id.to_path());
+        self.zk.ensure_path(&task_worker_path).await?;
+        let p = format!("{}/worker", task_worker_path);
+        let p = self
+            .zk
+            .create(
+                &p,
+                bincode::serialize(&self.self_id)?,
+                Acl::open_unsafe().clone(),
+                CreateMode::EphemeralSequential,
+            )
+            .await?;
+        let x = p
+            .split("/")
+            .last()
+            .and_then(|x| x[WORKER_LEN..].parse().ok())
+            .ok_or(anyhow!("failed to parse id"))?;
+        Ok(x)
     }
 
     pub async fn get_task_ctrl_info(
@@ -598,8 +636,9 @@ impl ZkMng {
         ctrl_info.status = status;
         self.set_task_ctrl_info(task_id, &ctrl_info).await
     }
-    pub fn report_task_completed(&self, task_id: TaskId) {
-        let _ = self.opr_tx.send(OperationEvent::TaskCompleted(task_id));
+    pub async fn report_task_completed(&self, task_id: TaskId)->anyhow::Result<()> {
+        self.task_out_queue(task_id).await?;
+        Ok(())
     }
     pub fn task_getted(&self, task_id: TaskId, task_type: TaskType) {
         let _ = self

@@ -1,6 +1,6 @@
 use crate::{
     task::{TaskBehaviour, TaskResult},
-    zk_mng::{SliceId, TaskId, TaskSliceId, TaskType, WorkerAddress, WorkerId, ZkEvent},
+    zk_mng::{SliceId, TaskId, TaskSliceId, TaskType, WorkerAddress, WorkerId, ZkEvent, self},
     ZkMng,
 };
 use anyhow::anyhow;
@@ -50,7 +50,7 @@ enum SliceStatus {
 pub struct Schedular<B> {
     task_behaviour: Arc<B>,
     opr_tx: mpsc::UnboundedSender<OperationEvent>,
-    zk_mng: Arc<ZkMng>,
+    pub zk_mng: Arc<ZkMng>,
     tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
     published_tasks: Arc<Mutex<HashMap<TaskId, oneshot::Sender<anyhow::Result<()>>>>>,
 }
@@ -69,6 +69,10 @@ enum OperationEvent {
 pub struct TaskHandle {}
 impl TaskHandle {}
 impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
+    pub async fn debug_info(&self) {
+        println!("tasks_data: {:?}", self.tasks_data.lock().await.len());
+        println!("published_tasks: {:?}", self.published_tasks.lock().await.len());
+    }
     pub async fn try_new(zk_addr: &str, task_behaviour: B) -> anyhow::Result<Self> {
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
         let (opr_tx, opr_rx) = mpsc::unbounded_channel();
@@ -145,12 +149,16 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                 .iter()
                 .all(|x| matches!(x.1.status, SliceStatus::Completed))
         {
-            // 自己完成了所有的工作，可以不用监控了
-            zk_mng.remove_task_slice_watch(task_id).await;
+            let slice_data = task_data.slices_data.entry(slice_id).or_default();
+            // 移除worker监控
+            slice_data.completed_workers.iter().flatten().for_each(|x| zk_mng.rmv_worker_watch(x.clone()));
+            // 自己完成了所有的工作，可以不用监控任务切片完成情况了
+            zk_mng.remove_task_slice_watch(task_id);
         }
         Ok(())
     }
     async fn proc_task_slice_failed(
+        zk_mng: Arc<ZkMng>,
         task_slice_id: TaskSliceId,
         worker_id: WorkerId,
         tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
@@ -166,6 +174,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         let mut completed_workers = slice_data.completed_workers.take().unwrap_or_default();
         completed_workers.insert(worker_id);
         slice_data.completed_workers = Some(completed_workers);
+        zk_mng.add_worker_watch(worker_id);
         Ok(())
     }
     async fn proc_task(
@@ -200,7 +209,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                 let _ = Self::proc_task_slice_success(zk_mng, task_slice_id, tasks_data).await;
             } else {
                 // 执行失败
-                let _ = Self::proc_task_slice_failed(task_slice_id, worker_id, tasks_data).await;
+                let _ = Self::proc_task_slice_failed(zk_mng, task_slice_id, worker_id, tasks_data).await;
             }
         }
 
@@ -221,36 +230,37 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
             })
             .await;
     }
-    async fn try_get_task(zk_mng: Arc<ZkMng>, tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>, task_id: TaskId) {
-        let task_ctrl_info = loop {
-            if let Ok((mut task_ctrl_info, version)) = zk_mng.get_task_ctrl_info(task_id).await {
+
+    async fn try_get_task(
+        zk_mng: Arc<ZkMng>,
+        tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+        task_id: TaskId,
+    ) -> anyhow::Result<()> {
+        let task_ctrl_info =
+            if let Ok((task_ctrl_info, _)) = zk_mng.get_task_ctrl_info(task_id).await {
                 if let Some(worker_wanted) = task_ctrl_info.workers_wanted() {
-                    if task_ctrl_info.cur_worker_list().unwrap() < worker_wanted {
-                        task_ctrl_info.add_worker(zk_mng.self_id());
-                        match zk_mng.try_set_task_ctrl_info(task_id, &task_ctrl_info, version).await {
-                            Ok(false) => {continue;} // 写入失败，继续尝试
-                            Ok(true) => {break Some(task_ctrl_info);}
-                            _ => {break None;}
-                        }
+                    let id = zk_mng.add_worker_to_task(task_id).await?;
+                    if id < worker_wanted {
+                        Some(task_ctrl_info)
                     } else {
-                        // 数量足够了
-                        break None;
+                        None
                     }
                 } else {
                     // 没有数量限制，所有worker都执行
-                    break Some(task_ctrl_info);
+                    Some(task_ctrl_info)
                 }
             } else {
-                break None;
-            }
-        };
+                None
+            };
+
         if let Some(task_ctrl_info) = task_ctrl_info {
             zk_mng.task_getted(task_id, task_ctrl_info.task_type());
-            tasks_data.lock().await.insert(task_id, TaskData::new(
-                task_ctrl_info.slice_num(),
-                task_ctrl_info.workers_wanted(),
-            ));
+            tasks_data.lock().await.insert(
+                task_id,
+                TaskData::new(task_ctrl_info.slice_num(), task_ctrl_info.workers_wanted()),
+            );
         }
+        Ok(())
     }
     async fn opr_proc(
         mut opr_rx: mpsc::UnboundedReceiver<OperationEvent>,
@@ -279,7 +289,11 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                     let mut lock = tasks_data.lock().await;
                     if let Entry::Vacant(e) = lock.entry(task_id) {
                         // 抢任务
-                       tokio::spawn(Self::try_get_task(zk_mng.clone(), tasks_data.clone(), task_id));
+                        tokio::spawn(Self::try_get_task(
+                            zk_mng.clone(),
+                            tasks_data.clone(),
+                            task_id,
+                        ));
                     }
                 }
                 OperationEvent::TryProc(task_slice_id, worker_id) => {
@@ -309,6 +323,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         if worker_entry.len() == task_data.slices_num {
             task_data.completed_worker_num += 1;
         }
+        println!("cur completed workers: {}", task_data.completed_worker_num);
         task_data.progress_info = Some(progress_info);
         // 判断是否所有的worker都完成了
         if let Some(wanted) = task_data.wanted_workers {
@@ -334,7 +349,9 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                     info!("task_published: {}", task_id.id());
                     let _ = opr_tx.send(OperationEvent::TaskInQueue(task_id));
                 }
-                ZkEvent::TaskCompleted(task_id) => {}
+                ZkEvent::TaskCompleted(task_id) => {
+                    tasks_data.lock().await.remove(&task_id);
+                }
                 ZkEvent::TaskSliceCompleted(task_slice_id, worker_id) => {
                     if worker_id == zk_mng.self_id() {
                         continue;
@@ -349,7 +366,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                         let _ = opr_tx.send(OperationEvent::TryProc(task_slice_id, worker_id));
                     } else {
                         // 判断task是否完成
-                        info!(
+                        println!(
                             "recv task slice completed: {}, {:?}",
                             worker_id.id(),
                             task_slice_id
@@ -368,13 +385,18 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                                 .await
                                 .remove(&task_slice_id.task_id())
                             {
-                                tx.send(Ok(())).unwrap();
+                                let r = zk_mng.report_task_completed(task_slice_id.task_id()).await;
+                                tx.send(r).unwrap();
                             }
                         }
                     }
                 }
-                ZkEvent::WorkerDataUpdated(worker_id, worker_data) => {}
-                ZkEvent::WorkerDeleted(worekr_id) => {}
+                ZkEvent::WorkerDataUpdated(worker_id, worker_data) => {
+                    // todo 选择负载降低的worker继续执行
+                }
+                ZkEvent::WorkerDeleted(worekr_id) => {
+                    // todo
+                }
             }
         }
     }
@@ -403,9 +425,12 @@ mod test_schedular {
                 .for_each_concurrent(0, |i| {
                     let all_client_clone = all_client.clone();
                     async move {
-                        let schedular = Schedular::try_new(&format!("127.0.0.1:{}", 2181), DummyTaskBehaviour {})
-                            .await
-                            .unwrap();
+                        let schedular = Schedular::try_new(
+                            &format!("127.0.0.1:{}", 2181),
+                            DummyTaskBehaviour {},
+                        )
+                        .await
+                        .unwrap();
                         all_client_clone.lock().await.push(schedular);
                     }
                 })
