@@ -1,13 +1,14 @@
 use anyhow::anyhow;
 use const_str::concat;
 use futures::stream::iter;
-use futures::StreamExt;
+use futures::{StreamExt, AsyncWriteExt};
 use libp2p::{Multiaddr, PeerId};
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::fmt::format;
+use std::thread::sleep;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -277,6 +278,7 @@ enum OperationEvent {
     SliceCompletedDeleted(TaskSliceId, WorkerId),
     WorkerDeleted(WorkerId),
     WorkerDataUpdated(WorkerId, WorkerData),
+    Stop(),
 }
 
 pub enum ZkEvent {
@@ -286,11 +288,24 @@ pub enum ZkEvent {
     WorkerDataUpdated(WorkerId, WorkerData),
     WorkerDeleted(WorkerId),
 }
-
+impl Drop for ZkMng {
+    fn drop(&mut self) {
+        self.close();
+        let zk = self.zk.clone();
+        tokio::spawn(async move {
+            let _ = zk.close().await;
+        });
+    }
+}
 impl ZkMng {
-    pub async fn debug_info(&self) {
-    println!("tasks_data_cache: {}", self.tasks_data_cache.lock().await.len());
-    println!("worker_data_cache: {}", self.worker_data_cache.lock().await.len());
+    pub fn debug_info(&self) {
+        println!("zk ref: {}", Arc::strong_count(&self.zk));
+        println!("task_queue_cache ref: {}", Arc::strong_count(&self.task_queue_cache));
+        println!("tasks_data_cache ref: {}", Arc::strong_count(&self.tasks_data_cache));
+        println!("worker_data_cache ref: {}", Arc::strong_count(&self.worker_data_cache));
+    }
+    pub fn close(&self) {
+        let _ = self.opr_tx.send(OperationEvent::Stop());
     }
     pub async fn connect(
         zk_addr: &str,
@@ -388,6 +403,9 @@ impl ZkMng {
     ) {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
+                OperationEvent::Stop() => {
+                    break;
+                }
                 OperationEvent::AddTaskDataWatcher(task_id) => {
                     info!("add task watch");
                     let _ = Self::create_task_slice_watch(
@@ -431,7 +449,6 @@ impl ZkMng {
                     cb(ZkEvent::TaskPublished(task_id));
                 }
                 OperationEvent::TaskCompleted(task_id) => {
-                    println!("task completed");
                     tasks_data_cache.lock().await.remove(&task_id);
                     cb(ZkEvent::TaskCompleted(task_id));
                 }

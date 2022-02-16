@@ -47,7 +47,7 @@ enum SliceStatus {
     Working,
     Completed,
 }
-pub struct Schedular<B> {
+pub struct Schedular<B: 'static + Send + Sync + TaskBehaviour> {
     task_behaviour: Arc<B>,
     opr_tx: mpsc::UnboundedSender<OperationEvent>,
     pub zk_mng: Arc<ZkMng>,
@@ -64,14 +64,23 @@ enum OperationEvent {
     ),
     TaskInQueue(TaskId),
     TryProc(TaskSliceId, WorkerId),
+    Stop(),
 }
 
-pub struct TaskHandle {}
-impl TaskHandle {}
+impl<B: 'static + Send + Sync + TaskBehaviour> Drop for Schedular<B> {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
     pub async fn debug_info(&self) {
-        println!("tasks_data: {:?}", self.tasks_data.lock().await.len());
-        println!("published_tasks: {:?}", self.published_tasks.lock().await.len());
+        println!("tasks_data: {:?} ref:{}", self.tasks_data.lock().await.len(), Arc::strong_count(&self.tasks_data));
+        println!("published_tasks: {:?} ref: {}", self.published_tasks.lock().await.len(), Arc::strong_count(&self.published_tasks));
+        println!("zkmng ref: {}", Arc::strong_count(&self.zk_mng));
+    }
+    pub fn close(&self) {
+        self.zk_mng.close();
+        let _ =self.opr_tx.send(OperationEvent::Stop());
     }
     pub async fn try_new(zk_addr: &str, task_behaviour: B) -> anyhow::Result<Self> {
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
@@ -271,6 +280,9 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
     ) {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
+                OperationEvent::Stop() => {
+                    break;
+                }
                 OperationEvent::PublishTask(task_id, slice_num, wanted_works, sender) => {
                     tasks_data
                         .lock()
