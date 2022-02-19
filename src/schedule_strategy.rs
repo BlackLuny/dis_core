@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -13,7 +13,7 @@ pub enum WorkerMetric {
     Pressure(usize),
     Latency(Duration),
 }
-enum Event {
+pub enum Event {
     Success(TaskSliceId, WorkerId),
     Failure(TaskSliceId, WorkerId),
     Stop,
@@ -62,6 +62,7 @@ impl Drop for Token {
 }
 #[async_trait]
 pub trait ScheduleStrategy: 'static + Send + Sync {
+    fn get_token_tx(&self) -> mpsc::UnboundedSender<Event>;
     /// 添加task候选worker
     async fn add_task_worker(&self, task_slice_id: TaskSliceId, worker_id: WorkerId);
 
@@ -69,10 +70,10 @@ pub trait ScheduleStrategy: 'static + Send + Sync {
     async fn rmv_worker(&self, worker_id: WorkerId);
 
     /// 选择task slice 最好的worker
-    async fn select_best_worker(&self, task_slice_id: TaskSliceId) -> Option<Token>;
+    async fn select_worker_strategy(&self, task_slice_id: TaskSliceId) -> Option<WorkerId>;
 
-    /// 选择worker的最好的task slice
-    async fn select_best_task_slice(&self, worker_id: WorkerId) -> Option<Token>;
+    /// 选择task slice 最好的worker
+    async fn select_task_strategy(&self, worker_id: WorkerId) -> Option<TaskSliceId>;
 
     /// 更新worker的metric
     fn update_worker_metric(&mut self, worker_id: WorkerId, metric: WorkerMetric);
@@ -90,13 +91,36 @@ pub trait ScheduleStrategy: 'static + Send + Sync {
     fn get_remote_worker_pressure(&self, remote_worker_id: WorkerId) -> Option<usize>;
 
     /// 评估是否可以做任务, 默认只比较压力，如果要覆盖，需要在找不到worker的时候返回true
-    fn evaluate(&self, task_slice_id: TaskSliceId, worker_id: WorkerId) -> bool {
+    fn evaluate(&self, _task_slice_id: TaskSliceId, worker_id: WorkerId) -> bool {
         let self_max_pressure = self.get_self_max_pressure();
         self.get_self_pressure() <= self_max_pressure
             && self
                 .get_remote_worker_pressure(worker_id)
                 .map(|p| p <= self_max_pressure)
                 .unwrap_or(true)
+    }
+
+    /// 选择task slice 最好的worker
+    async fn select_best_worker(&self, task_slice_id: TaskSliceId) -> Option<Token> {
+        match self
+            .select_worker_strategy(task_slice_id)
+            .await
+            .map(|worker_id| (worker_id, self.evaluate(task_slice_id, worker_id)))
+        {
+            Some((worker_id, true)) => Some(Token::new(task_slice_id, worker_id, self.get_token_tx())),
+            _ => None,
+        }
+    }
+    /// 选择worker的最好的task slice
+    async fn select_best_task_slice(&self, worker_id: WorkerId) -> Option<Token> {
+        match self
+        .select_task_strategy(worker_id)
+        .await
+        .map(|task_slice_id| (task_slice_id, self.evaluate(task_slice_id, worker_id)))
+    {
+        Some((task_slice_id, true)) => Some(Token::new(task_slice_id, worker_id, self.get_token_tx())),
+        _ => None,
+    }
     }
 }
 
@@ -170,7 +194,10 @@ impl SimpleScheduleStrategy {
                     }
                     Event::Failure(task_slice_id, _worker_id) => {
                         let mut l = tasks_slice_status_clone.lock().await;
-                        let status = l.remove(&task_slice_id).map(|s| s.to_incompleted()).unwrap();
+                        let status = l
+                            .remove(&task_slice_id)
+                            .map(|s| s.to_incompleted())
+                            .unwrap();
                         l.insert(task_slice_id, status);
                     }
                 }
@@ -188,6 +215,9 @@ impl SimpleScheduleStrategy {
 
 #[async_trait]
 impl ScheduleStrategy for SimpleScheduleStrategy {
+    fn get_token_tx(&self) ->mpsc::UnboundedSender<Event> {
+        self.event_sender.clone()
+    }
     /// 添加task候选worker
     async fn add_task_worker(&self, task_slice_id: TaskSliceId, worker_id: WorkerId) {
         let mut lock = self.tasks_slice_status.lock().await;
@@ -217,7 +247,7 @@ impl ScheduleStrategy for SimpleScheduleStrategy {
     }
 
     /// 选择task slice 最好的worker
-    async fn select_best_worker(&self, task_slice_id: TaskSliceId) -> Option<Token> {
+    async fn select_worker_strategy(&self, task_slice_id: TaskSliceId) -> Option<WorkerId> {
         let mut lock = self.tasks_slice_status.lock().await;
         // 按照latency和压力选择的worker
         match lock
@@ -251,14 +281,14 @@ impl ScheduleStrategy for SimpleScheduleStrategy {
                     .map(|x| x.to_working(worker))
                     .unwrap();
                 lock.insert(task_slice_id, status);
-                Some(Token::new(task_slice_id, worker, self.event_sender.clone()))
+                Some(worker)
             }
             None => None,
         }
     }
 
     /// 选择worker的最好的task slice
-    async fn select_best_task_slice(&self, worker_id: WorkerId) -> Option<Token> {
+    async fn select_task_strategy(&self, worker_id: WorkerId) -> Option<TaskSliceId> {
         let mut lock = self.tasks_slice_status.lock().await;
         // 找到剩余切片数最少的task
         match lock
@@ -281,11 +311,7 @@ impl ScheduleStrategy for SimpleScheduleStrategy {
                     .map(|x| x.to_working(worker_id))
                     .unwrap();
                 lock.insert(task_slice_id, status);
-                Some(Token::new(
-                    task_slice_id,
-                    worker_id,
-                    self.event_sender.clone(),
-                ))
+                Some(task_slice_id)
             }
             None => None,
         }
