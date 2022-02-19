@@ -1,6 +1,9 @@
 use crate::{
+    schedule_strategy::{ScheduleStrategy, Token, WorkerMetric},
     task::{TaskBehaviour, TaskResult},
-    zk_mng::{SliceId, TaskId, TaskSliceId, TaskType, WorkerAddress, WorkerId, ZkEvent, self},
+    zk_mng::{
+        self, SliceId, TaskId, TaskSliceId, TaskType, WorkerAddress, WorkerData, WorkerId, ZkEvent, WorkerStatus,
+    },
     ZkMng,
 };
 use anyhow::anyhow;
@@ -9,8 +12,12 @@ use log::info;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::{
+    select,
+    sync::{mpsc, oneshot, Mutex, RwLock},
+};
 
 struct TaskData {
     slices_data: HashMap<SliceId, SliceData>,
@@ -47,12 +54,14 @@ enum SliceStatus {
     Working,
     Completed,
 }
-pub struct Schedular<B: 'static + Send + Sync + TaskBehaviour> {
+pub struct Schedular<B: 'static + Send + Sync + TaskBehaviour, ST: ScheduleStrategy> {
     task_behaviour: Arc<B>,
+    strategy: Arc<RwLock<ST>>,
     opr_tx: mpsc::UnboundedSender<OperationEvent>,
     pub zk_mng: Arc<ZkMng>,
     tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
     published_tasks: Arc<Mutex<HashMap<TaskId, oneshot::Sender<anyhow::Result<()>>>>>,
+    pressure_report_stop_tx: mpsc::Sender<()>,
 }
 
 enum OperationEvent {
@@ -63,29 +72,73 @@ enum OperationEvent {
         oneshot::Sender<anyhow::Result<()>>,
     ),
     TaskInQueue(TaskId),
-    TryProc(TaskSliceId, WorkerId),
+    TryProc(TaskSliceId, WorkerId, Option<Token>),
     Stop(),
 }
 
-impl<B: 'static + Send + Sync + TaskBehaviour> Drop for Schedular<B> {
+impl<B: 'static + Send + Sync + TaskBehaviour, ST: ScheduleStrategy> Drop for Schedular<B, ST> {
     fn drop(&mut self) {
         self.close();
     }
 }
-impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
+impl<B: 'static + Send + Sync + TaskBehaviour, ST: ScheduleStrategy> Schedular<B, ST> {
     pub async fn debug_info(&self) {
-        println!("tasks_data: {:?} ref:{}", self.tasks_data.lock().await.len(), Arc::strong_count(&self.tasks_data));
-        println!("published_tasks: {:?} ref: {}", self.published_tasks.lock().await.len(), Arc::strong_count(&self.published_tasks));
+        println!(
+            "tasks_data: {:?} ref:{}",
+            self.tasks_data.lock().await.len(),
+            Arc::strong_count(&self.tasks_data)
+        );
+        println!(
+            "published_tasks: {:?} ref: {}",
+            self.published_tasks.lock().await.len(),
+            Arc::strong_count(&self.published_tasks)
+        );
         println!("zkmng ref: {}", Arc::strong_count(&self.zk_mng));
     }
     pub fn close(&self) {
         self.zk_mng.close();
-        let _ =self.opr_tx.send(OperationEvent::Stop());
+        let _ = self.opr_tx.send(OperationEvent::Stop());
+        let tx = self.pressure_report_stop_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(());
+        });
     }
-    pub async fn try_new(zk_addr: &str, task_behaviour: B) -> anyhow::Result<Self> {
+    async fn pressure_report_cycle(
+        zk_mng: Arc<ZkMng>,
+        mut pressure_report_stop_rx: mpsc::Receiver<()>,
+        task_behaviour: Arc<B>,
+        strategy: Arc<RwLock<ST>>,
+    ) {
+        let mut cur_pressure = 0;
+        loop {
+            select! {
+                _ = tokio::time::sleep(Duration::from_secs(1))  => {
+                    if let Ok(new_pressure) = task_behaviour.query_pressure().await {
+                        if new_pressure != cur_pressure {
+                            info!("report pressure");
+                            strategy.write().await.update_self_metric(WorkerMetric::Pressure(new_pressure));
+                            let status = if new_pressure > 0 {
+                                WorkerStatus::Working(new_pressure)
+                            } else {
+                                WorkerStatus::Idle
+                            };
+                            let _ = zk_mng.update_self_status(status).await;
+                            cur_pressure = new_pressure;
+                        }
+                    }
+                },
+                _ = pressure_report_stop_rx.recv() => {
+                    break;
+                }
+            }
+        }
+    }
+    pub async fn try_new(zk_addr: &str, task_behaviour: B, strategy: ST) -> anyhow::Result<Self> {
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
         let (opr_tx, opr_rx) = mpsc::unbounded_channel();
+        let (pressure_report_stop_tx, pressure_report_stop_rx) = mpsc::channel(1);
         let task_behaviour = Arc::new(task_behaviour);
+        let strategy = Arc::new(RwLock::new(strategy));
         let zk_mng = Arc::new(
             ZkMng::connect(zk_addr, move |evt| {
                 let _ = evt_tx.send(evt);
@@ -100,6 +153,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
             published_tasks.clone(),
             evt_rx,
             opr_tx.clone(),
+            strategy.clone(),
         ));
         tokio::spawn(Self::opr_proc(
             opr_rx,
@@ -107,8 +161,17 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
             tasks_data.clone(),
             published_tasks.clone(),
             task_behaviour.clone(),
+            strategy.clone(),
+        ));
+        tokio::spawn(Self::pressure_report_cycle(
+            zk_mng.clone(),
+            pressure_report_stop_rx,
+            task_behaviour.clone(),
+            strategy.clone(),
         ));
         Ok(Self {
+            pressure_report_stop_tx,
+            strategy,
             tasks_data,
             task_behaviour,
             zk_mng,
@@ -135,7 +198,9 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                 tx,
             ))
             .map_err(|e| anyhow!("send error: {}", e))?;
-        rx.await?
+        rx.await??;
+        //self.zk_mng.delete_task(task_id);
+        Ok(())
     }
     async fn proc_task_slice_success(
         zk_mng: Arc<ZkMng>,
@@ -160,7 +225,11 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         {
             let slice_data = task_data.slices_data.entry(slice_id).or_default();
             // 移除worker监控
-            slice_data.completed_workers.iter().flatten().for_each(|x| zk_mng.rmv_worker_watch(x.clone()));
+            slice_data
+                .completed_workers
+                .iter()
+                .flatten()
+                .for_each(|x| zk_mng.rmv_worker_watch(x.clone()));
             // 自己完成了所有的工作，可以不用监控任务切片完成情况了
             zk_mng.remove_task_slice_watch(task_id);
         }
@@ -192,6 +261,8 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         task_slice_id: TaskSliceId,
         worker_id: WorkerId,
         tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
+        token: Option<Token>,
+        strategy: Arc<RwLock<ST>>,
     ) -> anyhow::Result<()> {
         // 判断task的状态和自身的压力
         let pressure = task_behaviour.query_pressure().await?;
@@ -216,9 +287,21 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
             {
                 // 执行成功
                 let _ = Self::proc_task_slice_success(zk_mng, task_slice_id, tasks_data).await;
+                if let Some(mut token) = token {
+                    token.success();
+                }
             } else {
                 // 执行失败
-                let _ = Self::proc_task_slice_failed(zk_mng, task_slice_id, worker_id, tasks_data).await;
+                let _ = Self::proc_task_slice_failed(zk_mng, task_slice_id, worker_id, tasks_data)
+                    .await;
+                strategy
+                    .read()
+                    .await
+                    .add_task_worker(task_slice_id, worker_id)
+                    .await;
+                if let Some(mut token) = token {
+                    token.failure();
+                }
             }
         }
 
@@ -277,12 +360,11 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         tasks_data: Arc<Mutex<HashMap<TaskId, TaskData>>>,
         published_tasks: Arc<Mutex<HashMap<TaskId, oneshot::Sender<anyhow::Result<()>>>>>,
         task_behaviour: Arc<B>,
+        strategy: Arc<RwLock<ST>>,
     ) {
         while let Some(opr) = opr_rx.recv().await {
             match opr {
-                OperationEvent::Stop() => {
-                    break;
-                }
+                OperationEvent::Stop() => break,
                 OperationEvent::PublishTask(task_id, slice_num, wanted_works, sender) => {
                     tasks_data
                         .lock()
@@ -308,13 +390,15 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                         ));
                     }
                 }
-                OperationEvent::TryProc(task_slice_id, worker_id) => {
+                OperationEvent::TryProc(task_slice_id, worker_id, token) => {
                     tokio::spawn(Self::proc_task(
                         zk_mng.clone(),
                         task_behaviour.clone(),
                         task_slice_id,
                         worker_id,
                         tasks_data.clone(),
+                        token,
+                        strategy.clone(),
                     ));
                 }
             }
@@ -335,7 +419,6 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         if worker_entry.len() == task_data.slices_num {
             task_data.completed_worker_num += 1;
         }
-        println!("cur completed workers: {}", task_data.completed_worker_num);
         task_data.progress_info = Some(progress_info);
         // 判断是否所有的worker都完成了
         if let Some(wanted) = task_data.wanted_workers {
@@ -354,6 +437,7 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
         published_tasks: Arc<Mutex<HashMap<TaskId, oneshot::Sender<anyhow::Result<()>>>>>,
         mut evt_rx: mpsc::UnboundedReceiver<ZkEvent>,
         opr_tx: mpsc::UnboundedSender<OperationEvent>,
+        strategy: Arc<RwLock<ST>>,
     ) {
         while let Some(evt) = evt_rx.recv().await {
             match evt {
@@ -375,10 +459,16 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                         .is_none()
                     {
                         info!("try work: {:?}, from {}", task_slice_id, worker_id.id());
-                        let _ = opr_tx.send(OperationEvent::TryProc(task_slice_id, worker_id));
+                        if strategy.read().await.evaluate(task_slice_id, worker_id) {
+                            let _ = opr_tx.send(OperationEvent::TryProc(
+                                task_slice_id,
+                                worker_id,
+                                None,
+                            ));
+                        }
                     } else {
                         // 判断task是否完成
-                        println!(
+                        info!(
                             "recv task slice completed: {}, {:?}",
                             worker_id.id(),
                             task_slice_id
@@ -404,10 +494,25 @@ impl<B: 'static + Send + Sync + TaskBehaviour> Schedular<B> {
                     }
                 }
                 ZkEvent::WorkerDataUpdated(worker_id, worker_data) => {
-                    // todo 选择负载降低的worker继续执行
+                    info!("worker: {} data updated", worker_id.id());
+                    let mut st_lock = strategy.write().await;
+                    let pressure = worker_data.get_pressure();
+                    st_lock.update_worker_metric(worker_id, WorkerMetric::Pressure(pressure));
+                    if st_lock.get_self_pressure() > st_lock.get_self_max_pressure() {
+                        continue;
+                    }
+                    if let Some(token) = st_lock.select_best_task_slice(worker_id).await {
+                        println!("retry work: {:?} from: {}", token.task_slice_id(), token.worker_id().id());
+                        let _ = opr_tx.send(OperationEvent::TryProc(
+                            token.task_slice_id(),
+                            worker_id,
+                            Some(token),
+                        ));
+                    }
                 }
-                ZkEvent::WorkerDeleted(worekr_id) => {
-                    // todo
+                ZkEvent::WorkerDeleted(worker_id) => {
+                    info!("worker: {} deleted", worker_id.id());
+                    strategy.write().await.rmv_worker(worker_id).await;
                 }
             }
         }
@@ -421,7 +526,9 @@ mod test_schedular {
         time::{Duration, Instant},
     };
 
-    use crate::{dummy_task::DummyTaskBehaviour, zk_mng::TaskType};
+    use crate::{
+        dummy_task::DummyTaskBehaviour, schedule_strategy::SimpleScheduleStrategy, zk_mng::TaskType,
+    };
     use futures::{stream::iter, StreamExt};
     use libp2p::swarm::DummyBehaviour;
     use tokio::sync::Mutex;
@@ -440,6 +547,7 @@ mod test_schedular {
                         let schedular = Schedular::try_new(
                             &format!("127.0.0.1:{}", 2181),
                             DummyTaskBehaviour {},
+                            SimpleScheduleStrategy::new(25),
                         )
                         .await
                         .unwrap();
