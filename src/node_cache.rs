@@ -1,12 +1,13 @@
 use std::{sync::Arc};
 use tokio::sync::{Mutex, mpsc};
-use zookeeper_async::{ZooKeeper, ZooKeeperExt, Stat, ZkState, ZkResult, WatchedEvent, WatchedEventType, ZkError};
+use zookeeper_async::{ZooKeeper, ZooKeeperExt, Stat, ZkState, ZkResult, WatchedEvent, WatchedEventType, ZkError, Subscription};
 
 pub struct NodeCache {
     path: Arc<String>,
     zk: Arc<ZooKeeper>,
     data: Arc<Mutex<Option<Data>>>,
     channel: Option<mpsc::UnboundedSender<Operation>>,
+    subscript: Option<Subscription>,
 }
 
 /// Data contents of a znode and associated `Stat`.
@@ -20,6 +21,7 @@ enum Operation {
     Refresh(),
     Event(NodeCacheEvent),
     ZkStateEvent(ZkState),
+    Stop,
 }
 
 #[derive(Debug)]
@@ -29,6 +31,12 @@ pub enum NodeCacheEvent {
     DataUpdated(Data),
 }
 
+impl Drop for NodeCache {
+    fn drop(&mut self) {
+        self.subscript.take().map(|sub| self.zk.remove_listener(sub));
+        self.channel.take().map(|x| x.send(Operation::Stop));
+    }
+}
 impl NodeCache {
     pub async fn new(zk: Arc<ZooKeeper>, path: &str) -> ZkResult<Self> {
         let data = Arc::new(Mutex::new(None));
@@ -40,6 +48,7 @@ impl NodeCache {
             zk,
             data,
             channel: None,
+            subscript: None,
         })
     }
 
@@ -53,6 +62,7 @@ impl NodeCache {
     ) -> bool {
         let mut done = false;
         match op {
+            Operation::Stop => {done = true;},
             Operation::Initialize => {
                 debug!("initialising...");
                 let result = Self::get_data(
@@ -126,7 +136,7 @@ impl NodeCache {
         done
     }
     /// Start the cache. The cache is not started automatically. You must call this method.
-    pub fn start(&mut self, mut event_listener: impl FnMut(NodeCacheEvent) + 'static + Send + Sync) -> ZkResult<()> {
+    pub fn start(&mut self, event_listener: impl FnMut(NodeCacheEvent) + 'static + Send + Sync) -> ZkResult<()> {
         let (ops_chan_tx, mut ops_chan_rx) = mpsc::unbounded_channel();
         let ops_chan_rx_zk_events = ops_chan_tx.clone();
 
@@ -140,6 +150,7 @@ impl NodeCache {
         let path = self.path.clone();
         let data = self.data.clone();
         self.channel = Some(ops_chan_tx.clone());
+        self.subscript = Some(sub);
 
         tokio::spawn(async move {
             let mut done = false;
@@ -184,12 +195,9 @@ impl NodeCache {
         data: Arc<Mutex<Option<Data>>>,
         ops_chan: mpsc::UnboundedSender<Operation>,
     ) -> ZkResult<(Vec<u8>, Stat)> {
-        let path1 = path.to_owned();
-
         let data_watcher = move |event: WatchedEvent| {
             let data = data.clone();
             let ops_chan = ops_chan.clone();
-            let path1 = path1.clone();
 
             tokio::spawn(async move {
                 let mut data_locked = data.lock().await;
