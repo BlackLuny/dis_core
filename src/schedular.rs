@@ -112,17 +112,19 @@ impl<B: 'static + Send + Sync + TaskBehaviour, ST: ScheduleStrategy> Schedular<B
         strategy: Arc<RwLock<ST>>,
     ) {
         let mut cur_pressure = 0;
+        let max_pressure = strategy.read().await.get_self_max_pressure();
         loop {
             select! {
                 _ = tokio::time::sleep(Duration::from_secs(1))  => {
                     if let Ok(new_pressure) = task_behaviour.query_pressure().await {
                         if new_pressure != cur_pressure {
                             info!("report pressure");
-                            strategy.write().await.update_self_metric(WorkerMetric::Pressure(new_pressure));
-                            let status = if new_pressure > 0 {
-                                WorkerStatus::Working(new_pressure)
-                            } else {
-                                WorkerStatus::Idle
+                            let mut lock = strategy.write().await;
+                            lock.update_self_metric(WorkerMetric::Pressure(new_pressure));
+                            let status = match new_pressure {
+                                x if (1..max_pressure).contains(&x) => WorkerStatus::Working(new_pressure),
+                                x if x >= max_pressure => WorkerStatus::FullLoaded,
+                                _ => WorkerStatus::Idle,
                             };
                             let _ = zk_mng.update_self_status(status).await;
                             cur_pressure = new_pressure;
