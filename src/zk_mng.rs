@@ -105,6 +105,12 @@ impl TaskSliceId {
     }
 }
 
+impl<T: Into<TaskId>, S: Into<SliceId>> From<(T, S)> for TaskSliceId {
+    fn from(s: (T, S)) -> Self {
+        Self(s.0.into(), s.1.into())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct WorkerId(usize);
 
@@ -124,6 +130,12 @@ impl WorkerId {
     #[inline(always)]
     pub fn id(&self) -> usize {
         self.0
+    }
+}
+
+impl From<usize> for WorkerId {
+    fn from(s: usize) -> Self {
+        Self(s)
     }
 }
 

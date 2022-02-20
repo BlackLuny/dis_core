@@ -25,7 +25,7 @@ impl TaskBehaviour for DummyTaskBehaviour {
     async fn query_pressure(&self) -> anyhow::Result<usize> {
         // 变化太频繁会导致zookeeper性能下降
         let mut rng = rand::thread_rng();
-        let r = rng.gen_range(0, 1);
+        let r = rng.gen_range(0..1);
         Ok(r)
         // Ok(0)
     }

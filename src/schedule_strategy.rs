@@ -1,13 +1,13 @@
 use std::{
     cmp::Ordering,
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
 
 use crate::zk_mng::{TaskSliceId, WorkerId};
 use async_trait::async_trait;
-use libp2p::kad::store::RecordStore;
+use replace_with::replace_with_or_default;
 use tokio::sync::{mpsc, Mutex};
 pub enum WorkerMetric {
     Pressure(usize),
@@ -107,20 +107,24 @@ pub trait ScheduleStrategy: 'static + Send + Sync {
             .await
             .map(|worker_id| (worker_id, self.evaluate(task_slice_id, worker_id)))
         {
-            Some((worker_id, true)) => Some(Token::new(task_slice_id, worker_id, self.get_token_tx())),
+            Some((worker_id, true)) => {
+                Some(Token::new(task_slice_id, worker_id, self.get_token_tx()))
+            }
             _ => None,
         }
     }
     /// 选择worker的最好的task slice
     async fn select_best_task_slice(&self, worker_id: WorkerId) -> Option<Token> {
         match self
-        .select_task_strategy(worker_id)
-        .await
-        .map(|task_slice_id| (task_slice_id, self.evaluate(task_slice_id, worker_id)))
-    {
-        Some((task_slice_id, true)) => Some(Token::new(task_slice_id, worker_id, self.get_token_tx())),
-        _ => None,
-    }
+            .select_task_strategy(worker_id)
+            .await
+            .map(|task_slice_id| (task_slice_id, self.evaluate(task_slice_id, worker_id)))
+        {
+            Some((task_slice_id, true)) => {
+                Some(Token::new(task_slice_id, worker_id, self.get_token_tx()))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -189,16 +193,13 @@ impl SimpleScheduleStrategy {
                     Event::Stop => break,
                     Event::Success(task_slice_id, _worker_id) => {
                         let mut l = tasks_slice_status_clone.lock().await;
-                        let status = l.remove(&task_slice_id).map(|s| s.to_completed()).unwrap();
-                        l.insert(task_slice_id, status);
+                        l.get_mut(&task_slice_id)
+                            .map(|s| replace_with_or_default(s, |s| s.to_completed()));
                     }
                     Event::Failure(task_slice_id, _worker_id) => {
                         let mut l = tasks_slice_status_clone.lock().await;
-                        let status = l
-                            .remove(&task_slice_id)
-                            .map(|s| s.to_incompleted())
-                            .unwrap();
-                        l.insert(task_slice_id, status);
+                        l.get_mut(&task_slice_id)
+                            .map(|s| replace_with_or_default(s, |s| s.to_incompleted()));
                     }
                 }
             }
@@ -215,7 +216,7 @@ impl SimpleScheduleStrategy {
 
 #[async_trait]
 impl ScheduleStrategy for SimpleScheduleStrategy {
-    fn get_token_tx(&self) ->mpsc::UnboundedSender<Event> {
+    fn get_token_tx(&self) -> mpsc::UnboundedSender<Event> {
         self.event_sender.clone()
     }
     /// 添加task候选worker
@@ -276,11 +277,8 @@ impl ScheduleStrategy for SimpleScheduleStrategy {
             .map(|x| x.0)
         {
             Some(worker) => {
-                let status = lock
-                    .remove(&task_slice_id)
-                    .map(|x| x.to_working(worker))
-                    .unwrap();
-                lock.insert(task_slice_id, status);
+                lock.get_mut(&task_slice_id)
+                    .map(|s| replace_with_or_default(s, |s| s.to_working(worker)));
                 Some(worker)
             }
             None => None,
@@ -306,11 +304,8 @@ impl ScheduleStrategy for SimpleScheduleStrategy {
             .map(|x| *x.1 .1)
         {
             Some(task_slice_id) => {
-                let status = lock
-                    .remove(&task_slice_id)
-                    .map(|x| x.to_working(worker_id))
-                    .unwrap();
-                lock.insert(task_slice_id, status);
+                lock.get_mut(&task_slice_id)
+                    .map(|s| replace_with_or_default(s, |s| s.to_working(worker_id)));
                 Some(task_slice_id)
             }
             None => None,
@@ -362,5 +357,245 @@ impl ScheduleStrategy for SimpleScheduleStrategy {
             .get(&remote_worker_id)
             .and_then(|x| x.pressure.as_ref())
             .map(|x| *x)
+    }
+}
+
+mod test_strategy {
+    use std::time::Duration;
+
+    use crate::SimpleScheduleStrategy;
+
+    use super::{Token, ScheduleStrategy, WorkerMetric};
+
+    async fn report_success(mut token: Token) {
+        token.success();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    async fn report_failure(mut token: Token) {
+        token.failure();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    #[tokio::main]
+    #[test]
+    async fn test_select_best_worker_2worker_2tasks_4slices() {
+        let worker0 = 0.into();
+        let worker1 = 1.into();
+        let task0_slice0 = (0, 0).into();
+        let task0_slice1 = (0, 1).into();
+        let task1_slice0 = (1, 0).into();
+        let task1_slice1 = (1, 1).into();
+
+        let mut st = SimpleScheduleStrategy::new(20);
+        // add tasks and workers
+        st.add_task_worker(task0_slice0, worker0).await;
+        st.add_task_worker(task0_slice1, worker0).await;
+        st.add_task_worker(task1_slice0, worker0).await;
+        st.add_task_worker(task1_slice1, worker0).await;
+        st.add_task_worker(task0_slice0, worker1).await;
+        st.add_task_worker(task0_slice1, worker1).await;
+        st.add_task_worker(task1_slice0, worker1).await;
+        st.add_task_worker(task1_slice1, worker1).await;
+
+        // update workers metric
+        st.update_worker_metric(worker0, WorkerMetric::Pressure(10));
+        st.update_worker_metric(worker0, WorkerMetric::Latency(Duration::from_millis(100)));
+
+        st.update_worker_metric(worker1, WorkerMetric::Pressure(15));
+        st.update_worker_metric(worker1, WorkerMetric::Latency(Duration::from_millis(90)));
+
+        st.update_self_metric(WorkerMetric::Pressure(1));
+        st.update_self_metric(WorkerMetric::Latency(Duration::from_millis(50)));
+
+        let selected0 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 1); // 选择1
+
+        let selected1 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected1.is_some(), false); // 选择失败，因为已经被选择
+
+        report_failure(selected0.unwrap()).await; // 上报失败
+
+        //update latency
+        st.update_worker_metric(worker0, WorkerMetric::Latency(Duration::from_millis(90)));
+
+
+        let selected0 = st.select_best_worker(task0_slice1).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 0); // 选择0, 延迟相同时，选择压力小的
+
+        report_success(selected0.unwrap()).await;
+
+        // update pressure
+        st.update_worker_metric(worker0, WorkerMetric::Pressure(16));
+
+        let selected0 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 1); // 选择1, worker0的压力大于1
+        report_failure(selected0.unwrap()).await;
+
+        // update worker1 pressure to max pressure
+        st.update_worker_metric(worker1, WorkerMetric::Pressure(20));
+        let selected0 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 0); // 选择0, worker1的压力过大, 选择worker0
+        report_success(selected0.unwrap()).await;
+
+        // remove worker
+        st.rmv_worker(worker0).await;
+        st.rmv_worker(worker1).await;
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_select_best_worker_2worker_2tasks_4slices_no_latency_metric() {
+        let worker0 = 0.into();
+        let worker1 = 1.into();
+        let task0_slice0 = (0, 0).into();
+        let task0_slice1 = (0, 1).into();
+        let task1_slice0 = (1, 0).into();
+        let task1_slice1 = (1, 1).into();
+
+        let mut st = SimpleScheduleStrategy::new(20);
+        // add tasks and workers
+        st.add_task_worker(task0_slice0, worker0).await;
+        st.add_task_worker(task0_slice1, worker0).await;
+        st.add_task_worker(task1_slice0, worker0).await;
+        st.add_task_worker(task1_slice1, worker0).await;
+        st.add_task_worker(task0_slice0, worker1).await;
+        st.add_task_worker(task0_slice1, worker1).await;
+        st.add_task_worker(task1_slice0, worker1).await;
+        st.add_task_worker(task1_slice1, worker1).await;
+
+        // update workers metric
+        st.update_worker_metric(worker0, WorkerMetric::Pressure(10));
+        st.update_worker_metric(worker0, WorkerMetric::Latency(Duration::from_millis(100)));
+
+        st.update_worker_metric(worker1, WorkerMetric::Pressure(15));
+
+        st.update_self_metric(WorkerMetric::Pressure(1));
+
+        let selected0 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 1); // 选择1, 没有延迟认为latency为0
+
+        let selected1 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected1.is_some(), false); // 选择失败，因为已经被选择
+
+        report_failure(selected0.unwrap()).await; // 上报失败
+
+        //update latency
+        st.update_worker_metric(worker1, WorkerMetric::Latency(Duration::from_millis(200)));
+
+
+        let selected0 = st.select_best_worker(task0_slice1).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 0); // 选择0, 选择延迟小的
+
+        report_success(selected0.unwrap()).await;
+
+        // update pressure
+        st.update_worker_metric(worker0, WorkerMetric::Pressure(16));
+
+        let selected0 = st.select_best_worker(task0_slice0).await;
+        assert_eq!(selected0.as_ref().unwrap().worker_id().id(), 0); // 选择1, 延迟低
+        report_failure(selected0.unwrap()).await;
+
+        // update worker1 pressure to max pressure
+        st.update_worker_metric(worker0, WorkerMetric::Pressure(25));
+        st.update_worker_metric(worker1, WorkerMetric::Pressure(23));
+
+        let selected0 = st.select_best_worker(task1_slice0).await;
+        assert_eq!(selected0.is_some(), false); // 都选择失败，因为压力都过大
+
+        // remove worker
+        st.rmv_worker(worker0).await;
+        st.rmv_worker(worker1).await;
+    }
+    #[tokio::main]
+    #[test]
+    async fn test_select_best_task() {
+        let worker0 = 0.into();
+        let worker1 = 1.into();
+        let task0_slice0 = (0, 0).into();
+        let task1_slice0 = (1, 0).into();
+        let task1_slice1 = (1, 1).into();
+        let task1_slice2 = (1, 2).into();
+
+        let mut st = SimpleScheduleStrategy::new(20);
+        // add tasks and workers
+        st.add_task_worker(task0_slice0, worker0).await;
+        st.add_task_worker(task1_slice0, worker0).await;
+        st.add_task_worker(task1_slice1, worker0).await;
+        st.add_task_worker(task0_slice0, worker1).await;
+        st.add_task_worker(task1_slice0, worker1).await;
+        st.add_task_worker(task1_slice1, worker1).await;
+        st.add_task_worker(task1_slice2, worker1).await;
+        
+
+        // update workers metric
+        st.update_worker_metric(worker0, WorkerMetric::Pressure(10));
+        st.update_worker_metric(worker0, WorkerMetric::Latency(Duration::from_millis(100)));
+
+        st.update_worker_metric(worker1, WorkerMetric::Pressure(15));
+        st.update_worker_metric(worker0, WorkerMetric::Latency(Duration::from_millis(80)));
+
+        st.update_self_metric(WorkerMetric::Pressure(1));
+
+        let selected = st.select_best_task_slice(worker1).await;
+        assert_eq!(selected.as_ref().unwrap().task_slice_id(), task0_slice0);
+
+        // add task0 4 slice
+        st.add_task_worker((0, 1).into(), worker1).await;
+        st.add_task_worker((0, 2).into(), worker1).await;
+        st.add_task_worker((0, 3).into(), worker1).await;
+        st.add_task_worker((0, 4).into(), worker1).await;
+
+        report_success(selected.unwrap()).await;
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // select task1 because task1 has 3 slices, task0 has 4 slices incompleted
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 1.into());
+
+        report_success(selected.unwrap()).await;
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // select task1 because task1 has 2 slices, task0 has 4 slices incompleted
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 1.into());
+
+        report_success(selected.unwrap()).await;
+
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // select task1 because task1 has 1 slices, task0 has 4 slices incompleted
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 1.into());
+
+        report_success(selected.unwrap()).await;
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // select task0 has 4 slices incompleted, task1 all completed
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 0.into());
+
+        report_success(selected.unwrap()).await;
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // only task0
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 0.into());
+
+        report_success(selected.unwrap()).await;
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // only task0
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 0.into());
+
+        report_success(selected.unwrap()).await;
+
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // only task0
+        assert_eq!(selected.as_ref().unwrap().task_slice_id().task_id(), 0.into());
+
+        report_success(selected.unwrap()).await;
+
+        let selected = st.select_best_task_slice(worker1).await;
+        // no task
+        assert_eq!(selected.is_some(), false);
+        
+        // remove worker
+        st.rmv_worker(worker0).await;
+        st.rmv_worker(worker1).await;
     }
 }

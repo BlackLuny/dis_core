@@ -1,8 +1,10 @@
 use crate::{
     schedule_strategy::{ScheduleStrategy, Token, WorkerMetric},
     task::{TaskBehaviour, TaskResult},
+    utils::measure_time,
     zk_mng::{
-        self, SliceId, TaskId, TaskSliceId, TaskType, WorkerAddress, WorkerData, WorkerId, ZkEvent, WorkerStatus,
+        self, SliceId, TaskId, TaskSliceId, TaskType, WorkerAddress, WorkerData, WorkerId,
+        WorkerStatus, ZkEvent,
     },
     ZkMng,
 };
@@ -282,10 +284,14 @@ impl<B: 'static + Send + Sync + TaskBehaviour, ST: ScheduleStrategy> Schedular<B
             drop(lock);
             // 开始工作
             let worker_address = zk_mng.get_worker_address(worker_id).await?;
-            if let Ok(TaskResult::Completed) =
-                task_behaviour.try_work(task_slice_id, worker_address).await
+            if let (Ok(TaskResult::Completed), used_time) =
+                measure_time(task_behaviour.try_work(task_slice_id, worker_address)).await
             {
                 // 执行成功
+                strategy
+                    .write()
+                    .await
+                    .update_worker_metric(worker_id, WorkerMetric::Latency(used_time));
                 let _ = Self::proc_task_slice_success(zk_mng, task_slice_id, tasks_data).await;
                 if let Some(mut token) = token {
                     token.success();
@@ -502,7 +508,11 @@ impl<B: 'static + Send + Sync + TaskBehaviour, ST: ScheduleStrategy> Schedular<B
                         continue;
                     }
                     if let Some(token) = st_lock.select_best_task_slice(worker_id).await {
-                        println!("retry work: {:?} from: {}", token.task_slice_id(), token.worker_id().id());
+                        println!(
+                            "retry work: {:?} from: {}",
+                            token.task_slice_id(),
+                            token.worker_id().id()
+                        );
                         let _ = opr_tx.send(OperationEvent::TryProc(
                             token.task_slice_id(),
                             worker_id,
